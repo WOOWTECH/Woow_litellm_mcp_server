@@ -23,7 +23,7 @@ English version: [README.md](./README.md)
 ### 架構
 
 ```
-                       ┌───────────────────────── 單一容器 ────────────────────────┐
+                       ┌───────────────────────── 單一容器 ─────────────────────────┐
   Claude / MCP 用戶端  │                                                            │
         │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)      │
         │  HTTPS       │    ├─ AuthMiddleware (JWT)  ── /api/*  管理 GUI + API       │
@@ -32,7 +32,7 @@ English version: [README.md](./README.md)
                        │                                     ▼                       │
                        │        McpProcessManager ► woow_litellm_mcp_server (127.0.0.1)
                        │                                     │  transport=http /mcp/ │
-                       └──────────────────────────────┼──────────────────────┘
+                       └─────────────────────────────────────┼───────────────────────┘
                                                               ▼
                                      LiteLLM 閘道（Bearer master key，port 4000）
 ```

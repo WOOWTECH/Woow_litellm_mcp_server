@@ -4,7 +4,7 @@
 #
 # This file documents TWO deployment paths. Pick ONE Deployment.
 #
-# ┌───────────────────────────────────────────────────────────┐
+# ┌───────────────────────────────────────────────────────────────────────────┐
 # │ PATH A — image-based (production, requires a registry)                      │
 # │   Build the admin image from the repo Dockerfile and push it to a registry  │
 # │   (GHCR / kaniko in-cluster), then run it. This bundles the admin console + │
@@ -16,15 +16,15 @@
 # │     #     --context git://github.com/WOOWTECH/Woow_litellm_mcp_server.git \  │
 # │     #     --dockerfile Dockerfile \                                          │
 # │     #     --destination ghcr.io/woowtech/woow-litellm-mcp-admin:v1           │
-# └───────────────────────────────────────────────────────────┘
-# ┌───────────────────────────────────────────────────────────┐
+# └───────────────────────────────────────────────────────────────────────────┘
+# ┌───────────────────────────────────────────────────────────────────────────┐
 # │ PATH B — git-clone (registryless, THE LIVE PATH used by this workflow)       │
 # │   No image build. An initContainer (alpine/git) clones the PUBLIC repo into  │
 # │   an emptyDir; the main python:3.12-slim container pip-installs the package  │
 # │   and launches the FastMCP server over streamable-http on :8000. This is     │
 # │   what actually runs in namespace `litellm-mcp`. See "PATH B" block below    │
 # │   (ACTIVE by default).                                                       │
-# └───────────────────────────────────────────────────────────┘
+# └───────────────────────────────────────────────────────────────────────────┘
 #
 # Apply:
 #   kubectl apply -f k8s-deploy.yaml
@@ -135,6 +135,7 @@ spec:
           ports:
             - name: http
               containerPort: 8000
+          # First boot runs pip install at pod start — be generous on readiness.
           # Streamable-HTTP GET /mcp/ returns 406 without an SSE Accept header,
           # so an httpGet probe flaps. tcpSocket just confirms the listener.
           readinessProbe:
@@ -143,7 +144,7 @@ spec:
             initialDelaySeconds: 45
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 40
+            failureThreshold: 30
           livenessProbe:
             tcpSocket:
               port: 8000

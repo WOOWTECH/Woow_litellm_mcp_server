@@ -1,0 +1,34 @@
+# Cloudflare Worker config for the Woow LiteLLM MCP edge.
+#
+# Deploy the direct pass-through worker (default):
+#   npx wrangler deploy
+# Deploy the OAuth gateway variant instead:
+#   npx wrangler deploy --name woow-litellm-mcp-oauth  # after switching `main`
+#
+# Set secrets (never put them in [vars]):
+#   npx wrangler secret put UPSTREAM_TOKEN
+#   npx wrangler secret put OAUTH_CLIENT_SECRET   # oauth variant only
+#   npx wrangler secret put ACCESS_TOKENS         # oauth variant only
+
+name = "woow-litellm-mcp"
+main = "mcp-direct.js"
+compatibility_date = "2025-01-01"
+
+# Give the MCP endpoint its own hostname. Replace with your zone/route.
+# routes = [
+#   { pattern = "mcp.woowtech.io/*", zone_name = "woowtech.io" }
+# ]
+
+[vars]
+# The admin proxy Service reachable from the edge (Cloudflare Tunnel origin, or
+# a public hostname fronting the litellm-mcp-admin Service on :8080).
+UPSTREAM_BASE = "https://litellm-mcp-admin.internal"
+
+# --- OAuth gateway variant only (mcp-oauth-gateway.js) ---
+# OAUTH_ISSUER = "https://mcp.woowtech.io"
+# OAUTH_CLIENT_ID = "woow-litellm-mcp"
+
+# Secrets (set via `wrangler secret put`, NOT here):
+#   UPSTREAM_TOKEN        the mcp_auth_token for /private_{token}/
+#   OAUTH_CLIENT_SECRET   oauth variant
+#   ACCESS_TOKENS         oauth variant (comma-separated accepted bearers)

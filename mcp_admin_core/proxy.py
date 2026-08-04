@@ -16,6 +16,7 @@ satisfies this.
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -99,6 +100,22 @@ async def mcp_proxy(token: str, path: str, request: Request) -> StreamingRespons
     for h in ("transfer-encoding", "content-encoding", "content-length"):
         resp_headers.pop(h, None)
     resp_headers["x-accel-buffering"] = "no"
+
+    # Keep upstream redirects inside the proxy's namespace.  FastMCP answers a
+    # request for ``/mcp`` with a 307 to ``/mcp/`` and builds that Location from
+    # the upstream Host header, i.e. ``https://localhost/mcp/`` — an address on
+    # the *client's* own loopback, with the ``/private_{token}`` prefix gone.
+    # Any client that normalises the trailing slash away therefore lost the
+    # session before it started.  Rewrite the Location to a relative path under
+    # this proxy so the redirect lands back here, token intact.
+    location = resp_headers.get("location")
+    if location:
+        parsed = urlsplit(location)
+        if not parsed.netloc or parsed.hostname in {"localhost", "127.0.0.1"}:
+            rewritten = f"/private_{token}/{parsed.path.lstrip('/')}"
+            resp_headers["location"] = urlunsplit(
+                ("", "", rewritten, parsed.query, parsed.fragment)
+            )
 
     async def stream_body():
         try:

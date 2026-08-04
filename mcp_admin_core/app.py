@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth.middleware import AuthMiddleware, login_router
+from .discovery import router as discovery_router
 from .process import get_process_manager
 from .proxy import router as proxy_router
 from .routers.settings import router as settings_router
@@ -74,6 +75,10 @@ def create_app(
     app.include_router(login_router)
     app.include_router(settings_router)
     app.include_router(proxy_router)
+    # OAuth-discovery 404s — must precede the SPA fallback below, otherwise the
+    # catch-all answers the probes with 200 HTML and MCP clients try to run an
+    # OAuth registration that does not exist here.  See discovery.py.
+    app.include_router(discovery_router)
 
     if extra_routers:
         for router in extra_routers:

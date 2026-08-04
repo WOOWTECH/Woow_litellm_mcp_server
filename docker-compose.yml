@@ -1,0 +1,72 @@
+# Woow LiteLLM MCP Admin — local / self-hosted compose stack
+# ===========================================================
+# One service is required: `litellm-mcp-admin`. It is a single container that
+# runs three logical components as one unit (matching the EMQX reference):
+#
+#   1. the FastMCP server (LiteLLM tool surface)  — spawned as a loopback child
+#   2. the MCP admin console web GUI              — uvicorn on :8080
+#   3. the encrypted proxy / admin-core           — reverse proxy at
+#                                                   /private_{token}/mcp/
+#
+# Bring it up:
+#   JWT_SECRET=$(openssl rand -hex 32) docker compose up --build
+#
+# Then open http://localhost:8080, log in with the seeded admin password,
+# set the LiteLLM connection (base_url + master key), and Claude's connector
+# points at  http://localhost:8080/private_{mcp_auth_token}/mcp/
+#
+# The optional `litellm` service is a convenience for a fully local demo; comment
+# it back in and point the admin connection at http://litellm:4000.
+
+services:
+  litellm-mcp-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/woowtech/woow-litellm-mcp-admin:latest
+    container_name: litellm-mcp-admin
+    ports:
+      - "8080:8080"
+    environment:
+      # Signs the admin GUI JWT. MUST be set to a stable random value in prod,
+      # otherwise every restart invalidates existing sessions.
+      JWT_SECRET: "${JWT_SECRET:?set JWT_SECRET, e.g. openssl rand -hex 32}"
+      JWT_EXPIRY_HOURS: "${JWT_EXPIRY_HOURS:-12}"
+      # Where the file-backed ConfigStore persists (masked secrets, tool switches,
+      # connection, mcp_auth_token). Lives on the named volume below.
+      MCP_ADMIN_CONFIG: "/data/config.json"
+      # Optional: pre-seed the upstream connection instead of typing it in the GUI.
+      # These map to the FastMCP child via the Settings env_prefix (LITELLM_MCP_).
+      # LITELLM_MCP_BASE_URL:   "http://litellm:4000"
+      # LITELLM_MCP_MASTER_KEY: "${LITELLM_MASTER_KEY}"
+      # Optional gating (also settable from the Tools/Permissions GUI):
+      # LITELLM_MCP_READONLY:        "false"
+      # LITELLM_MCP_DISABLED_TOOLS:  ""
+    volumes:
+      - litellm_mcp_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # --- Optional: a local LiteLLM gateway to drive for a self-contained demo. ---
+  # Uncomment and provide a config.yaml + provider keys to run end-to-end offline.
+  #
+  # litellm:
+  #   image: ghcr.io/berriai/litellm:main-v1.83.14-stable
+  #   container_name: litellm
+  #   command: ["--config", "/app/config.yaml", "--port", "4000"]
+  #   ports:
+  #     - "4000:4000"
+  #   environment:
+  #     LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-local-dev-master-key}"
+  #     # OPENAI_API_KEY, ANTHROPIC_API_KEY, ... as needed by your config.yaml
+  #   volumes:
+  #     - ./litellm.config.yaml:/app/config.yaml:ro
+  #   restart: unless-stopped
+
+volumes:
+  litellm_mcp_data:

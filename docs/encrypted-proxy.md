@@ -78,6 +78,45 @@ A `200` with `event: message` and an `mcp-session-id` response header means the
 whole chain is live. Feed that session id back as `Mcp-Session-Id` on a
 `tools/list` call and you should see all 38 `litellm_*` tools.
 
+## Why a connector could not connect (and curl could)
+
+Two origin bugs let hand-rolled requests succeed while a real MCP connector
+failed at registration. Both are fixed; both are the kind of thing that comes
+back if the routing table is reordered, so they are worth stating.
+
+**1. OAuth discovery answered `200 text/html`.** Before its first JSON-RPC call
+a connector probes `/.well-known/oauth-protected-resource`,
+`/.well-known/oauth-authorization-server` and friends to learn whether it must
+authenticate. Those paths matched nothing — so the SPA catch-all served the
+admin console's `index.html` with a `200`. To the client that reads as *"yes,
+there is an authorization server here"*, so it proceeded to Dynamic Client
+Registration at `/register`, got the same HTML shell, and gave up with
+*"Couldn't register with …'s sign-in service"*. `mcp_admin_core.discovery` now
+answers those paths with a JSON `404`, registered **before** the SPA fallback;
+discovery fails fast and the client falls back to anonymous access.
+
+**2. A redirect leaked the upstream origin and dropped the token.** FastMCP
+answers a request for `/mcp` (no trailing slash) with `307 Location:
+https://localhost/mcp/`, built from the upstream `Host` header. Through the
+proxy that pointed the client at *its own* loopback with the
+`/private_{token}` prefix gone — fatal for any client that normalises the
+trailing slash away. The proxy now rewrites a `Location` whose host is
+`localhost`/`127.0.0.1` into a relative `/private_{token}/…` path.
+
+Check both after any change:
+
+```bash
+# expect: 404 application/json, NOT 200 text/html
+curl -si https://<your-host>/.well-known/oauth-authorization-server | head -1
+curl -si https://<your-host>/register | head -1
+
+# expect: 307 with Location: /private_<token>/mcp/  (relative, token intact)
+curl -si -X POST https://<your-host>/private_<token>/mcp | grep -i '^location'
+```
+
+If a connector already failed against this URL, delete it and add it again —
+clients cache the outcome of a failed OAuth handshake.
+
 ## Rotating the token
 
 `POST /api/tokens/rotate` (admin JWT) generates a new token, persists it, and

@@ -135,20 +135,19 @@ spec:
           ports:
             - name: http
               containerPort: 8000
-          # First boot runs pip install at pod start — be generous on readiness.
+          # Streamable-HTTP GET /mcp/ returns 406 without an SSE Accept header,
+          # so an httpGet probe flaps. tcpSocket just confirms the listener.
           readinessProbe:
-            httpGet:
-              path: /mcp/
+            tcpSocket:
               port: 8000
             initialDelaySeconds: 45
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 30
+            failureThreshold: 40
           livenessProbe:
-            httpGet:
-              path: /mcp/
+            tcpSocket:
               port: 8000
-            initialDelaySeconds: 120
+            initialDelaySeconds: 180
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 6

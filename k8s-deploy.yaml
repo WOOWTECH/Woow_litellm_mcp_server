@@ -1,0 +1,293 @@
+# =============================================================================
+# Woow LiteLLM MCP Server — Kubernetes / k3s manifests
+# =============================================================================
+#
+# This file documents TWO deployment paths. Pick ONE Deployment.
+#
+# ┌───────────────────────────────────────────────────────────┐
+# │ PATH A — image-based (production, requires a registry)                      │
+# │   Build the admin image from the repo Dockerfile and push it to a registry  │
+# │   (GHCR / kaniko in-cluster), then run it. This bundles the admin console + │
+# │   encrypted proxy + FastMCP child on :8080. Recommended when you have a     │
+# │   registry. See "PATH A" block below (commented out by default).            │
+# │                                                                             │
+# │     # kaniko example (in-cluster build, no local docker):                   │
+# │     #   /kaniko/executor \                                                   │
+# │     #     --context git://github.com/WOOWTECH/Woow_litellm_mcp_server.git \  │
+# │     #     --dockerfile Dockerfile \                                          │
+# │     #     --destination ghcr.io/woowtech/woow-litellm-mcp-admin:v1           │
+# └───────────────────────────────────────────────────────────┘
+# ┌───────────────────────────────────────────────────────────┐
+# │ PATH B — git-clone (registryless, THE LIVE PATH used by this workflow)       │
+# │   No image build. An initContainer (alpine/git) clones the PUBLIC repo into  │
+# │   an emptyDir; the main python:3.12-slim container pip-installs the package  │
+# │   and launches the FastMCP server over streamable-http on :8000. This is     │
+# │   what actually runs in namespace `litellm-mcp`. See "PATH B" block below    │
+# │   (ACTIVE by default).                                                       │
+# └───────────────────────────────────────────────────────────┘
+#
+# Apply:
+#   kubectl apply -f k8s-deploy.yaml
+# (or, in this workflow, via mcp__k3s_mcp__resources_create_or_update per doc)
+#
+# The Secret below carries the real LiteLLM master key and JWT secret. It is a
+# PLACEHOLDER here — never commit real values. Apply the real Secret out-of-band.
+# =============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: litellm-mcp
+  labels:
+    app.kubernetes.io/part-of: woow-litellm-mcp
+---
+# -----------------------------------------------------------------------------
+# Secret — PLACEHOLDER VALUES ONLY.
+# Replace out-of-band (kubectl / resources_create_or_update). Do NOT commit real
+# keys. See k8s-secret.example.yaml for a standalone copy of this template.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: litellm-mcp-secret
+  namespace: litellm-mcp
+type: Opaque
+stringData:
+  # In-cluster Service DNS of the LiteLLM gateway (namespace litellm, svc litellm).
+  LITELLM_BASE_URL: "http://litellm.litellm.svc.cluster.local:4000"
+  # LiteLLM master key — REPLACE. Never store the real value in git.
+  LITELLM_MASTER_KEY: "sk-REPLACE_ME"
+  # Random hex for signing admin-GUI JWTs (only used by the image-based path).
+  JWT_SECRET: "REPLACE_WITH_RANDOM_HEX"
+---
+# =============================================================================
+# PATH B (ACTIVE) — git-clone Deployment, no custom image.
+# initContainer clones the public repo -> emptyDir; main container pip-installs
+# and runs the FastMCP server on streamable-http :8000 at path /mcp/.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-mcp-server
+  namespace: litellm-mcp
+  labels:
+    app: litellm-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm-mcp-server
+  template:
+    metadata:
+      labels:
+        app: litellm-mcp-server
+    spec:
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: pipcache
+          emptyDir: {}
+      initContainers:
+        - name: git-clone
+          image: alpine/git:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              rm -rf /repo/* /repo/.git || true
+              git clone --depth 1 \
+                https://github.com/WOOWTECH/Woow_litellm_mcp_server /repo
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+      containers:
+        - name: mcp-server
+          image: python:3.12-slim
+          workingDir: /repo
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              pip install --no-cache-dir --cache-dir /pipcache .
+              exec python -m woow_litellm_mcp_server.server \
+                --transport http --host 0.0.0.0 --port 8000 --path /mcp/
+          env:
+            # Map Secret -> the server's LITELLM_MCP_ Settings prefix.
+            - name: LITELLM_MCP_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-mcp-secret
+                  key: LITELLM_BASE_URL
+            - name: LITELLM_MCP_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-mcp-secret
+                  key: LITELLM_MASTER_KEY
+            # Optional gating (uncomment / set as needed):
+            # - name: LITELLM_MCP_READONLY
+            #   value: "false"
+            # - name: LITELLM_MCP_DISABLED_TOOLS
+            #   value: ""
+            - name: PIP_DISABLE_PIP_VERSION_CHECK
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8000
+          # First boot runs pip install at pod start — be generous on readiness.
+          readinessProbe:
+            httpGet:
+              path: /mcp/
+              port: 8000
+            initialDelaySeconds: 45
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /mcp/
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+            - name: pipcache
+              mountPath: /pipcache
+---
+# -----------------------------------------------------------------------------
+# Service — ClusterIP for the git-clone FastMCP server.
+# In-cluster consumers reach it at:
+#   http://litellm-mcp.litellm-mcp.svc.cluster.local:8000/mcp/
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-mcp
+  namespace: litellm-mcp
+  labels:
+    app: litellm-mcp-server
+spec:
+  type: ClusterIP
+  selector:
+    app: litellm-mcp-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+# =============================================================================
+# PATH A (image-based) — DISABLED template. Uncomment when you have a registry
+# image built from the repo Dockerfile. Runs the admin console + encrypted proxy
+# + FastMCP child on :8080, with config persisted to a PVC-backed /data.
+# =============================================================================
+# apiVersion: apps/v1
+# kind: Deployment
+# metadata:
+#   name: litellm-mcp-admin
+#   namespace: litellm-mcp
+#   labels:
+#     app: litellm-mcp-admin
+# spec:
+#   replicas: 1
+#   selector:
+#     matchLabels:
+#       app: litellm-mcp-admin
+#   template:
+#     metadata:
+#       labels:
+#         app: litellm-mcp-admin
+#     spec:
+#       volumes:
+#         - name: data
+#           persistentVolumeClaim:
+#             claimName: litellm-mcp-data
+#       initContainers:
+#         # Seed /data/config.json (chmod 600) from the Secret so the admin boots
+#         # with the upstream connection already wired, no GUI step required.
+#         - name: seed-config
+#           image: python:3.12-slim
+#           command:
+#             - python
+#             - -c
+#             - |
+#               import json, os, pathlib
+#               p = pathlib.Path("/data/config.json")
+#               if not p.exists():
+#                   p.write_text(json.dumps({
+#                       "connection": {
+#                           "litellm_mcp_base_url": os.environ["LITELLM_BASE_URL"],
+#                           "litellm_mcp_master_key": os.environ["LITELLM_MASTER_KEY"],
+#                       },
+#                       "mcp_server": {
+#                           "command": "python",
+#                           "args": ["-m", "woow_litellm_mcp_server.server",
+#                                    "--transport", "http", "--host", "127.0.0.1",
+#                                    "--port", "3000", "--path", "/mcp/"],
+#                           "port": 3000, "env": {},
+#                       },
+#                   }, indent=2))
+#                   os.chmod(p, 0o600)
+#           env:
+#             - name: LITELLM_BASE_URL
+#               valueFrom: { secretKeyRef: { name: litellm-mcp-secret, key: LITELLM_BASE_URL } }
+#             - name: LITELLM_MASTER_KEY
+#               valueFrom: { secretKeyRef: { name: litellm-mcp-secret, key: LITELLM_MASTER_KEY } }
+#           volumeMounts:
+#             - name: data
+#               mountPath: /data
+#       containers:
+#         - name: admin
+#           image: ghcr.io/woowtech/woow-litellm-mcp-admin:v1   # built from Dockerfile
+#           ports:
+#             - containerPort: 8080
+#           env:
+#             - name: MCP_ADMIN_CONFIG
+#               value: /data/config.json
+#             - name: JWT_EXPIRY_HOURS
+#               value: "12"
+#             - name: JWT_SECRET
+#               valueFrom: { secretKeyRef: { name: litellm-mcp-secret, key: JWT_SECRET } }
+#           readinessProbe:
+#             httpGet: { path: /healthz, port: 8080 }
+#             initialDelaySeconds: 10
+#           livenessProbe:
+#             httpGet: { path: /healthz, port: 8080 }
+#             initialDelaySeconds: 30
+#           volumeMounts:
+#             - name: data
+#               mountPath: /data
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: litellm-mcp-data
+#   namespace: litellm-mcp
+# spec:
+#   accessModes: ["ReadWriteOnce"]
+#   resources:
+#     requests:
+#       storage: 128Mi
+# ---
+# apiVersion: v1
+# kind: Service
+# metadata:
+#   name: litellm-mcp-admin
+#   namespace: litellm-mcp
+# spec:
+#   type: ClusterIP
+#   selector:
+#     app: litellm-mcp-admin
+#   ports:
+#     - port: 8080
+#       targetPort: 8080

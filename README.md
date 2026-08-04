@@ -23,7 +23,7 @@ MCP client) reach the tools over a single hardened endpoint.
 ### Architecture
 
 ```
-                       ┌───────────────────────── single container ─────────────────────────┐
+                       ┌───────────────────── single container ──────────────────┐
   Claude / MCP client  │                                                                     │
         │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)               │
         │  HTTPS        │    ├─ AuthMiddleware (JWT)  ── /api/*  admin GUI + API              │
@@ -32,7 +32,7 @@ MCP client) reach the tools over a single hardened endpoint.
                        │                                       ▼                              │
                        │             McpProcessManager ► woow_litellm_mcp_server (127.0.0.1)  │
                        │                                       │  transport=http  /mcp/       │
-                       └───────────────────────────────────────┼──────────────────────────────┘
+                       └─────────────────────────────────┼────────────────────────────┘
                                                                 ▼
                                         LiteLLM gateway  (Bearer master key, port 4000)
 ```
@@ -124,6 +124,25 @@ kubectl apply -f k8s-deploy.yaml
 In-cluster consumers then reach it at
 `http://litellm-mcp.litellm-mcp.svc.cluster.local:8000/mcp/`.
 
+### 4. Kubernetes — admin console + encrypted proxy (registryless)
+
+`k8s-deploy.yaml` alone gives you a bare, unauthenticated MCP server that is
+safe only because it never leaves the cluster. To publish it, deploy
+[`k8s-admin-deploy.yaml`](./k8s-admin-deploy.yaml) as well: same git-clone
+trick, but it builds the SPA, seeds `/data/config.json` on a PVC, and runs the
+admin console on `:8080` with the FastMCP child spawned on `127.0.0.1:3000`.
+
+```bash
+kubectl apply -f k8s-deploy.yaml         # namespace + litellm-mcp-secret
+kubectl apply -f k8s-admin-deploy.yaml   # console + encrypted proxy + child
+```
+
+Point a Cloudflare tunnel (or any ingress) at
+`http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080` and the only
+public MCP door is `/private_<mcp_auth_token>/mcp/`. Full design notes,
+verification commands and the Bot Fight Mode caveat live in
+[`docs/encrypted-proxy.md`](./docs/encrypted-proxy.md).
+
 ---
 
 ## Connecting Claude
@@ -135,9 +154,10 @@ https://<your-admin-hostname>/private_<mcp_auth_token>/mcp/
 ```
 
 Rotate `mcp_auth_token` from the **Tokens** page (or
-`POST /api/settings/mcp_auth_token/rotate`). Optionally front it with the
-Cloudflare Worker in [`cloudflare/`](./cloudflare/) to give the MCP endpoint its
-own hostname and a clean anonymous fallback for OAuth discovery.
+`POST /api/tokens/rotate`) — the previous URL dies immediately. Optionally
+front it with the Cloudflare Worker in [`cloudflare/`](./cloudflare/) to give
+the MCP endpoint its own hostname and a clean anonymous fallback for OAuth
+discovery.
 
 ---
 

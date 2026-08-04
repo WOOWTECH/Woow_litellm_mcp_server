@@ -1,0 +1,236 @@
+# =============================================================================
+# Woow LiteLLM MCP Admin — admin console + ENCRYPTED PROXY + FastMCP child
+# =============================================================================
+#
+# This is the registryless ("git-clone") counterpart of PATH A in
+# k8s-deploy.yaml: no image build, no registry. Three initContainers prepare an
+# emptyDir checkout (clone -> build the SPA -> seed /data/config.json), then one
+# python:3.12-slim container pip-installs `.[admin]` and serves
+# `litellm_mcp_admin.main:app` on :8080.
+#
+# What runs inside that single pod:
+#
+#   :8080  admin console (SPA + /api/*, JWT-gated)
+#          /healthz                      unauthenticated liveness
+#          /private_{token}/mcp/         the ENCRYPTED PROXY endpoint
+#   :3000  the FastMCP child, bound to 127.0.0.1 ONLY (never exposed)
+#
+# The proxy validates {token} against `mcp_auth_token` in /data/config.json and
+# reverse-proxies to the loopback child, relaying `Mcp-Session-Id` and
+# `MCP-Protocol-Version` and streaming `text/event-stream` untouched, so the
+# stateful Streamable-HTTP flow works end to end. Rotate the token from the
+# console (POST /api/tokens/rotate) — the old URL dies immediately.
+#
+# Apply order:
+#   kubectl apply -f k8s-deploy.yaml         # namespace + litellm-mcp-secret
+#   kubectl apply -f k8s-admin-deploy.yaml   # this file
+#
+# Secrets: PLACEHOLDERS ONLY. Never commit real values.
+# =============================================================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: litellm-mcp-admin-secret
+  namespace: litellm-mcp
+type: Opaque
+stringData:
+  # Password for the admin console login. REPLACE.
+  ADMIN_PASSWORD: "REPLACE_ME"
+  # The URL-path token in /private_{token}/mcp/. Generate with:
+  #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+  # REPLACE — treat it exactly like a password, it IS the proxy credential.
+  MCP_AUTH_TOKEN: "REPLACE_ME_TOKEN_URLSAFE_32"
+  # Signs admin-console JWTs. Set once so logins survive restarts. REPLACE.
+  #   python -c "import secrets; print(secrets.token_hex(32))"
+  JWT_SECRET: "REPLACE_ME_HEX_32"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: litellm-mcp-data
+  namespace: litellm-mcp
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-mcp-admin
+  namespace: litellm-mcp
+  labels:
+    app: litellm-mcp-admin
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the config PVC is ReadWriteOnce and two pods
+  # would both try to spawn the FastMCP child against the same /data.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: litellm-mcp-admin
+  template:
+    metadata:
+      labels:
+        app: litellm-mcp-admin
+    spec:
+      volumes:
+        - name: repo
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: litellm-mcp-data
+      initContainers:
+        - name: git-clone
+          image: alpine/git:latest
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              rm -rf /repo/* /repo/.git || true
+              git clone --depth 1 https://github.com/WOOWTECH/Woow_litellm_mcp_server /repo
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+        # Builds the SPA the same way the Dockerfile's node stage does, into
+        # /repo/static (create_app falls back to $CWD/static). Deliberately
+        # non-fatal: if npm is unreachable the API and the proxy still serve.
+        - name: spa-build
+          image: node:20-alpine
+          workingDir: /repo/frontend
+          command:
+            - sh
+            - -c
+            - |
+              set -x
+              cp /repo/frontend-overrides/ConnectionConfig.jsx src/pages/ConnectionConfig.jsx || true
+              find ./src -type f \( -name '*.jsx' -o -name '*.js' \) -print0 \
+                | xargs -0 sed -i \
+                    -e 's/EMQX MCP Admin/LiteLLM MCP Admin/g' \
+                    -e 's/EMQX Broker/LiteLLM Gateway/g' \
+                    -e 's/\bEMQX\b/LiteLLM/g' || true
+              npm install --no-audit --no-fund && npm run build \
+                && mkdir -p /repo/static && cp -r dist/* /repo/static/ \
+                || echo "SPA build failed - admin API + proxy will still run"
+              exit 0
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+        # Seeds /data/config.json (chmod 600) so the pod boots fully wired:
+        # upstream connection, proxy token, and the loopback child command.
+        # Re-runs on every restart and rewrites only the keys it owns, so
+        # tool switches and token_history set from the GUI survive.
+        - name: seed-config
+          image: python:3.12-slim
+          command:
+            - python
+            - -c
+            - |
+              import json, os, pathlib
+              p = pathlib.Path("/data/config.json")
+              cfg = json.loads(p.read_text()) if p.exists() else {}
+              cfg["admin_password"] = os.environ["ADMIN_PASSWORD"]
+              cfg["mcp_auth_token"] = os.environ["MCP_AUTH_TOKEN"]
+              cfg["connection"] = {
+                  "litellm_mcp_base_url": os.environ["LITELLM_BASE_URL"],
+                  "litellm_mcp_master_key": os.environ["LITELLM_MASTER_KEY"],
+              }
+              cfg["mcp_server"] = {
+                  "command": "python",
+                  "args": ["-m", "woow_litellm_mcp_server.server",
+                           "--transport", "http", "--host", "127.0.0.1",
+                           "--port", "3000", "--path", "/mcp/"],
+                  "port": 3000,
+                  "env": {},
+              }
+              cfg.setdefault("proxy", {"timeout": 86400})
+              cfg.setdefault("tools", {"disabled": [], "disabled_operations": {}})
+              cfg.setdefault("token_history", [])
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(json.dumps(cfg, indent=2))
+              os.chmod(p, 0o600)
+              print("seeded", p)
+          env:
+            - name: ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: litellm-mcp-admin-secret, key: ADMIN_PASSWORD } }
+            - name: MCP_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: litellm-mcp-admin-secret, key: MCP_AUTH_TOKEN } }
+            - name: LITELLM_BASE_URL
+              valueFrom: { secretKeyRef: { name: litellm-mcp-secret, key: LITELLM_BASE_URL } }
+            - name: LITELLM_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: litellm-mcp-secret, key: LITELLM_MASTER_KEY } }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: admin
+          image: python:3.12-slim
+          workingDir: /repo
+          command:
+            - sh
+            - -c
+            - |
+              set -eux
+              pip install --no-cache-dir ".[admin]"
+              exec uvicorn litellm_mcp_admin.main:app --host 0.0.0.0 --port 8080
+          env:
+            - name: MCP_ADMIN_CONFIG
+              value: /data/config.json
+            - name: JWT_EXPIRY_HOURS
+              value: "12"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: litellm-mcp-admin-secret, key: JWT_SECRET } }
+          ports:
+            - name: http
+              containerPort: 8080
+          # /healthz is unauthenticated and cheap; pip install runs at pod start
+          # so readiness gets a long failureThreshold instead of a long delay.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 180
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: repo
+              mountPath: /repo
+            - name: data
+              mountPath: /data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-mcp-admin
+  namespace: litellm-mcp
+  labels:
+    app: litellm-mcp-admin
+spec:
+  type: ClusterIP
+  selector:
+    app: litellm-mcp-admin
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

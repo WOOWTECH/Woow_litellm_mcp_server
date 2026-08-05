@@ -32,7 +32,9 @@ def test_registered_names_match_registry_exactly() -> None:
 
 def test_surface_size_is_pinned() -> None:
     # Guard against accidental additions/removals of the tool surface.
-    assert len(TOOL_REGISTRY) == 38
+    # 40, not 38: litellm_plugin_info + litellm_delete_plugin were added because
+    # without a delete tool a plugin registered over MCP could never be removed.
+    assert len(TOOL_REGISTRY) == 40
     assert len(all_tool_names()) == len(set(all_tool_names())), "duplicate tool name"
 
 

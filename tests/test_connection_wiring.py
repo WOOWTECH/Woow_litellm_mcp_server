@@ -8,6 +8,8 @@ would silently ignore the operator's configuration.
 
 from __future__ import annotations
 
+import json
+
 from litellm_mcp_admin.routers.config import CONNECTION_KEYS
 from litellm_mcp_admin.store import env_from_tool_settings
 from woow_litellm_mcp_server.settings import Settings
@@ -34,28 +36,70 @@ def test_connection_env_actually_loads_into_settings(monkeypatch) -> None:
     assert cfg.master_key == "sk-test-123"
 
 
-def test_tool_switch_env_keys_are_prefixed_and_parse() -> None:
+def test_tool_switch_env_is_json_not_csv() -> None:
+    """The writer must emit JSON: pydantic-settings json-decodes these fields."""
     env = env_from_tool_settings(
         {
             "readonly": True,
             "disabled_tools": ["litellm_delete_key", "litellm_delete_team"],
             "disabled_categories": ["chat"],
+            "disabled_operations": {"litellm_list_keys": ["delete"]},
         }
     )
     for key in env:
         assert key.startswith(ENV_PREFIX), key
 
-    # The load-bearing switches must round-trip into Settings.
-    cfg = Settings(
-        readonly=env["LITELLM_MCP_READONLY"],
-        disabled_tools=env["LITELLM_MCP_DISABLED_TOOLS"],
-        disabled_categories=env["LITELLM_MCP_DISABLED_CATEGORIES"],
+    # A bare "litellm_delete_key" (the old CSV form) is not valid JSON, so
+    # pydantic-settings raised SettingsError before any validator ran and the
+    # MCP child exited 1 — one toggle on the Tools page killed the connector.
+    assert json.loads(env["LITELLM_MCP_DISABLED_TOOLS"]) == [
+        "litellm_delete_key",
+        "litellm_delete_team",
+    ]
+    assert json.loads(env["LITELLM_MCP_DISABLED_CATEGORIES"]) == ["chat"]
+    assert json.loads(env["LITELLM_MCP_DISABLED_OPERATIONS"]) == {
+        "litellm_list_keys": ["delete"]
+    }
+    assert env["LITELLM_MCP_READONLY"] == "true"
+
+
+def test_tool_switch_env_round_trips_through_the_environment(monkeypatch) -> None:
+    """Exactly the production path: env vars -> Settings() in the child."""
+    env = env_from_tool_settings(
+        {
+            "readonly": True,
+            "disabled_tools": ["litellm_delete_key", "litellm_delete_team"],
+            "disabled_categories": ["chat"],
+            "disabled_operations": {"litellm_list_keys": ["delete"]},
+        }
     )
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+    cfg = Settings()
     assert cfg.readonly is True
     assert cfg.disabled_tools == ["litellm_delete_key", "litellm_delete_team"]
     assert cfg.disabled_categories == ["chat"]
+    assert cfg.disabled_operations == {"litellm_list_keys": ["delete"]}
 
 
-def test_disabled_tools_csv_is_split() -> None:
+def test_empty_switch_sets_do_not_kill_the_child(monkeypatch) -> None:
+    """"Nothing disabled" must serialise to "[]"/"{}", never to ""."""
+    env = env_from_tool_settings({})
+    assert env["LITELLM_MCP_DISABLED_TOOLS"] == "[]"
+    assert env["LITELLM_MCP_DISABLED_CATEGORIES"] == "[]"
+    assert env["LITELLM_MCP_DISABLED_OPERATIONS"] == "{}"
+    assert env["LITELLM_MCP_READONLY"] == "false"
+
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    cfg = Settings()  # used to raise SettingsError -> child exit code 1
+    assert cfg.disabled_tools == []
+    assert cfg.disabled_categories == []
+    assert cfg.readonly is False
+
+
+def test_disabled_tools_csv_is_still_accepted() -> None:
+    """Config files written by older builds must keep loading."""
     cfg = Settings(disabled_tools="litellm_delete_key, litellm_block_key")
     assert cfg.disabled_tools == ["litellm_delete_key", "litellm_block_key"]

@@ -2,11 +2,10 @@
 # Woow LiteLLM MCP Admin — admin console + ENCRYPTED PROXY + FastMCP child
 # =============================================================================
 #
-# This is the registryless ("git-clone") counterpart of PATH A in
-# k8s-deploy.yaml: no image build, no registry. Three initContainers prepare an
-# emptyDir checkout (clone -> build the SPA -> seed /data/config.json), then one
-# python:3.12-slim container pip-installs `.[admin]` and serves
-# `litellm_mcp_admin.main:app` on :8080.
+# THIS IS THE ONLY DEPLOYMENT PATH. Registryless ("git-clone"): no image build,
+# no registry. Three initContainers prepare an emptyDir checkout (clone -> build
+# the SPA -> seed /data/config.json), then one python:3.12-slim container
+# pip-installs `.[admin]` and serves `litellm_mcp_admin.main:app` on :8080.
 #
 # What runs inside that single pod:
 #
@@ -15,6 +14,15 @@
 #          /private_{token}/mcp/         the ENCRYPTED PROXY endpoint
 #   :3000  the FastMCP child, bound to 127.0.0.1 ONLY (never exposed)
 #
+# The FastMCP server is NOT a separate workload. It is a child process of the
+# console, spawned by mcp_admin_core/process.py from the `mcp_server` block this
+# file seeds into /data/config.json. Binding it to loopback is what makes the
+# token-checking proxy the only door, by construction rather than by policy.
+#
+# The repository used to ship a second manifest that ran the same server bare on
+# 0.0.0.0:8000 with no authentication in front of it. It has been removed —
+# see FINDING-003 in findings.md. Do not reintroduce it.
+#
 # The proxy validates {token} against `mcp_auth_token` in /data/config.json and
 # reverse-proxies to the loopback child, relaying `Mcp-Session-Id` and
 # `MCP-Protocol-Version` and streaming `text/event-stream` untouched, so the
@@ -22,7 +30,7 @@
 # console (POST /api/tokens/rotate) — the old URL dies immediately.
 #
 # Apply order:
-#   kubectl apply -f k8s-deploy.yaml         # namespace + litellm-mcp-secret
+#   kubectl apply -f k8s-base.yaml           # namespace + litellm-mcp-secret
 #   kubectl apply -f k8s-admin-deploy.yaml   # this file
 #
 # Secrets: PLACEHOLDERS ONLY. Never commit real values.
@@ -135,8 +143,20 @@ spec:
               import json, os, pathlib
               p = pathlib.Path("/data/config.json")
               cfg = json.loads(p.read_text()) if p.exists() else {}
-              cfg["admin_password"] = os.environ["ADMIN_PASSWORD"]
-              cfg["mcp_auth_token"] = os.environ["MCP_AUTH_TOKEN"]
+              # setdefault, NOT assignment. These two are the console's own
+              # credentials and the console can change them at runtime: the
+              # Settings page changes admin_password, the Tokens page rotates
+              # mcp_auth_token. Assigning here unconditionally made every pod
+              # restart silently revert both to whatever the Secret still held —
+              # a rotated token would keep working until the next restart and
+              # then die without anyone touching it. This was FINDING-004.
+              # The Secret seeds the FIRST boot; after that /data is the truth.
+              cfg.setdefault("admin_password", os.environ["ADMIN_PASSWORD"])
+              cfg.setdefault("mcp_auth_token", os.environ["MCP_AUTH_TOKEN"])
+              # The upstream connection is different: it is infrastructure, not
+              # user state, and the Secret is its source of truth. Rotating the
+              # LiteLLM master key must reach the console on the next restart,
+              # so this one stays an assignment on purpose.
               cfg["connection"] = {
                   "litellm_mcp_base_url": os.environ["LITELLM_BASE_URL"],
                   "litellm_mcp_master_key": os.environ["LITELLM_MASTER_KEY"],

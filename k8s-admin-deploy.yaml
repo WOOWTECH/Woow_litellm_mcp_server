@@ -141,16 +141,35 @@ spec:
                   "litellm_mcp_base_url": os.environ["LITELLM_BASE_URL"],
                   "litellm_mcp_master_key": os.environ["LITELLM_MASTER_KEY"],
               }
+              # Preserve the child env across restarts: the Tools page writes the
+              # LITELLM_MCP_* gating switches in here, and blindly resetting it to
+              # {} silently un-did every GUI toggle on every pod restart.
+              prev_env = (cfg.get("mcp_server") or {}).get("env") or {}
               cfg["mcp_server"] = {
                   "command": "python",
                   "args": ["-m", "woow_litellm_mcp_server.server",
                            "--transport", "http", "--host", "127.0.0.1",
                            "--port", "3000", "--path", "/mcp/"],
                   "port": 3000,
-                  "env": {},
+                  "env": prev_env,
               }
               cfg.setdefault("proxy", {"timeout": 86400})
-              cfg.setdefault("tools", {"disabled": [], "disabled_operations": {}})
+              # Canonical tools shape. `disabled` is the legacy key; migrate it into
+              # disabled_tools once and drop it so the reader never sees both.
+              tools = cfg.get("tools") or {}
+              legacy = tools.pop("disabled", None)
+              if legacy:
+                  tools["disabled_tools"] = sorted(
+                      set(tools.get("disabled_tools") or []) | set(legacy))
+              tools.setdefault("readonly", False)
+              tools.setdefault("disabled_categories", [])
+              tools.setdefault("disabled_tools", [])
+              tools.setdefault("disabled_operations", {})
+              perms = tools.get("permissions") or {}
+              perms.setdefault("allowed_tools", ["*"])
+              perms.setdefault("denied_tools", [])
+              tools["permissions"] = perms
+              cfg["tools"] = tools
               cfg.setdefault("token_history", [])
               p.parent.mkdir(parents=True, exist_ok=True)
               p.write_text(json.dumps(cfg, indent=2))

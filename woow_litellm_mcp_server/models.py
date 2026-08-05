@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _Base(BaseModel):
@@ -101,13 +101,31 @@ class HealthStatus(_Base):
 
 
 class PluginInfo(_Base):
-    """A Claude-Code skill-hub plugin entry."""
+    """A Claude-Code skill-hub plugin entry.
+
+    ``source`` is an OBJECT upstream (``{"source": "github", "repo": "org/repo"}``),
+    not a string: declaring it ``str`` made ``model_validate`` raise on every
+    real gateway record. A bare string is still accepted and normalised so old
+    captured payloads (and the string form ``register_plugin`` used to send)
+    keep validating.
+    """
 
     name: str | None = None
-    source: str | None = None
+    source: dict[str, str] | None = None
+    id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     version: str | None = None
     description: str | None = None
     category: str | None = None
     domain: str | None = None
     namespace: str | None = None
     enabled: bool | None = None
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def _coerce_source(cls, value: Any) -> Any:
+        """Accept the legacy bare-string source, mirroring register_plugin."""
+        if isinstance(value, str):
+            return {"source": value}
+        return value

@@ -117,9 +117,15 @@ async def litellm_request(
             "for this operation. Details: " + body
         )
     if status == 404:
+        # Lead with the resource interpretation: in practice ~every 404 here is
+        # a bad identifier ("Key not found in database"), and telling an LLM the
+        # *endpoint* may not exist sends it hunting for a different route or
+        # concluding the server is misconfigured.
         raise LiteLLMApiError(
-            f"LiteLLM returned 404 Not Found for {method.upper()} {path}. "
-            f"The resource or endpoint does not exist. Details: {body}"
+            f"LiteLLM returned 404 Not Found for {method.upper()} {path} — the "
+            f"requested resource does not exist; check the identifier you "
+            f"passed. (If the identifier is definitely correct, the endpoint "
+            f"itself may be unavailable on this gateway.) Details: {body}"
         )
     if status == 422 or status == 400:
         raise LiteLLMApiError(

@@ -23,16 +23,16 @@ MCP client) reach the tools over a single hardened endpoint.
 ### Architecture
 
 ```
-                       ┌───────────────────── single container ──────────────────┐
-  Claude / MCP client  │                                                                     │
-        │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)               │
-        │  HTTPS        │    ├─ AuthMiddleware (JWT)  ── /api/*  admin GUI + API              │
+                       ┌───────────────────────── single container ───────────────────────────┐
+  Claude / MCP client  │                                                                      │
+        │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)                │
+        │  HTTPS       │    ├─ AuthMiddleware (JWT)  ── /api/*  admin GUI + API               │
         ▼              │    ├─ proxy  /private_{token}/mcp/  ──┐                              │
   Cloudflare edge ─────┼──► └─ SPA (React)                     │ reverse proxy (nginx-free)   │
                        │                                       ▼                              │
                        │             McpProcessManager ► woow_litellm_mcp_server (127.0.0.1)  │
                        │                                       │  transport=http  /mcp/       │
-                       └─────────────────────────────────┼────────────────────────────┘
+                       └───────────────────────────────────────┼──────────────────────────────┘
                                                                 ▼
                                         LiteLLM gateway  (Bearer master key, port 4000)
 ```

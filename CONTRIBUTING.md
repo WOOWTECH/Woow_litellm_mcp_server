@@ -17,7 +17,11 @@ The three installable pieces:
   `mcp_admin_core.pyproject.toml`; keep it byte-compatible with upstream — only
   comments should differ from the EMQX reference.
 
-## Running the server
+## Running the server (development only)
+
+Nothing authenticates this interface. In the deployed topology the server never runs
+this way — the admin console spawns it as a child on `127.0.0.1:3000` and the only
+public door is the console's token-gated proxy. Keep the dev instance on loopback too.
 
 ```bash
 export LITELLM_MCP_BASE_URL=http://localhost:4000
@@ -26,8 +30,8 @@ export LITELLM_MCP_MASTER_KEY=sk-...          # never commit a real key
 # stdio (local MCP clients)
 python -m woow_litellm_mcp_server.server --transport stdio
 
-# Streamable-HTTP (deployed default)
-python -m woow_litellm_mcp_server.server --transport http --host 0.0.0.0 --port 8000 --path /mcp/
+# Streamable-HTTP, loopback
+python -m woow_litellm_mcp_server.server --transport http --host 127.0.0.1 --port 8000 --path /mcp/
 ```
 
 ## Running the admin console

@@ -33,7 +33,7 @@ Cloudflare Worker (this dir)     ── injects /private_{token}/ ──►
       ▼
 litellm-mcp-admin :8080  (encrypted proxy, JWT-gated GUI)
       ▼  127.0.0.1:3000 loopback
-FastMCP child (woow_litellm_mcp_server) — 36 LiteLLM tools
+FastMCP child (woow_litellm_mcp_server) — 40 LiteLLM tools
 ```
 
 The worker is a plain `fetch()` pass-through, so the Streamable-HTTP flow

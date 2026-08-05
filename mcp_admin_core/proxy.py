@@ -15,6 +15,7 @@ satisfies this.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from urllib.parse import urlsplit, urlunsplit
 
@@ -28,14 +29,38 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["mcp-proxy"])
 
-# Shared client with long timeout for MCP streaming calls
+# Shared client with long timeout for MCP streaming calls.  The cache is keyed
+# on the configured timeout: memoising on the *first* call froze whatever
+# ``proxy.timeout`` happened to be live at boot, so editing it in the GUI wrote
+# to disk, read back correctly and changed nothing until the pod was restarted.
 _client: httpx.AsyncClient | None = None
+_client_timeout: float | None = None
+# Keep a reference to the close task; a bare create_task() may be garbage
+# collected before it runs.
+_closing: set[asyncio.Task[None]] = set()
 
 
 def _get_client(timeout: float = 86400) -> httpx.AsyncClient:
-    global _client  # noqa: PLW0603
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0))
+    global _client, _client_timeout  # noqa: PLW0603
+    if _client is not None and not _client.is_closed and _client_timeout == timeout:
+        return _client
+
+    superseded = _client
+    _client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0))
+    _client_timeout = timeout
+
+    if superseded is not None and not superseded.is_closed:
+        # Only reached when the operator actually changed the timeout, so the
+        # cost (any stream still running on the old client is cut, and the
+        # connector reconnects) is paid once per edit rather than per request.
+        try:
+            task = asyncio.get_running_loop().create_task(superseded.aclose())
+        except RuntimeError:  # no loop — nothing is in flight either
+            pass
+        else:
+            _closing.add(task)
+            task.add_done_callback(_closing.discard)
+
     return _client
 
 
@@ -80,7 +105,13 @@ async def mcp_proxy(token: str, path: str, request: Request) -> StreamingRespons
     # Read body
     body = await request.body()
 
-    client = _get_client(proxy_cfg.get("timeout", 86400))
+    # Coerce: a hand-edited config.json can hold "86400" as a string, and
+    # httpx.Timeout would raise on it *inside* the request path.
+    try:
+        timeout = float(proxy_cfg.get("timeout") or 86400)
+    except (TypeError, ValueError):
+        timeout = 86400.0
+    client = _get_client(timeout)
 
     try:
         upstream_req = client.build_request(

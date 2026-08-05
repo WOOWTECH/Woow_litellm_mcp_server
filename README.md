@@ -116,7 +116,7 @@ The suite is one container running one uvicorn process that fronts three things:
 admin API, the SPA, and a reverse proxy to a loopback-bound MCP child.
 
 ```
-                       ┌─────────────────────── single container ───────────────────────────┐
+                       ┌───────────────────────── single container ───────────────────────────┐
   Claude / MCP client  │                                                                      │
         │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)                │
         │  HTTPS       │    ├─ AuthMiddleware (JWT)  ── /api/*  admin GUI + API               │
@@ -125,7 +125,7 @@ admin API, the SPA, and a reverse proxy to a loopback-bound MCP child.
                        │                                       ▼                              │
                        │             McpProcessManager ► woow_litellm_mcp_server (127.0.0.1)  │
                        │                                       │  transport=http  /mcp/       │
-                       └────────────────────────────────────────┼──────────────────────────────┘
+                       └───────────────────────────────────────┼──────────────────────────────┘
                                                                ▼
                                         LiteLLM gateway  (Bearer master key, port 4000)
 ```
@@ -326,7 +326,7 @@ Two namespaces, two deployments, one shared cluster DNS name between them.
   │  Service  litellm  :4000  ◄───────┼───┼──   └─ init  seed-config   python:3.12-slim│
   │                                   │   │   └─ main  admin           :8080           │
   │  Secret   master key, salt key    │   │  PVC  litellm-mcp-data → /data/config.json │
-  └─────────────────────────────────┘   └────────────────────────────────────────────┘
+  └───────────────────────────────────┘   └────────────────────────────────────────────┘
                   ▲                                          ▲
                   │ Cloudflare tunnel                        │ Cloudflare tunnel
            litellm.woowtech.io                       litellm-mcp.woowtech.io

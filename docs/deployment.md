@@ -7,14 +7,81 @@ live deployment at `https://litellm-mcp.woowtech.io`.
 
 ## Topology
 
-| Namespace | Workload | Image | Exposure |
-|---|---|---|---|
-| `litellm` | Deployment `litellm` | `ghcr.io/berriai/litellm:v1.83.14-stable` | Service `:4000`, tunnel → `litellm.woowtech.io` |
-| `litellm-mcp` | Deployment `litellm-mcp-admin` | `python:3.12-slim` + init chain | Service `:8080`, tunnel → `litellm-mcp.woowtech.io` |
+There are **three** workloads, not two. `litellm-mcp` runs two independent Deployments,
+and only one of them is reachable from outside the cluster.
+
+| Namespace | Deployment | Image | Service | Public |
+|---|---|---|---|---|
+| `litellm` | `litellm` | `ghcr.io/berriai/litellm:v1.83.14-stable` | `litellm:4000` | tunnel → `litellm.woowtech.io` |
+| `litellm-mcp` | `litellm-mcp-admin` | `python:3.12-slim` + 3 init containers | `litellm-mcp-admin:8080` | tunnel → `litellm-mcp.woowtech.io` |
+| `litellm-mcp` | `litellm-mcp-server` | `python:3.12-slim` + 1 init container | `litellm-mcp:8000` | **none — cluster-internal only** |
 
 The MCP suite reaches the gateway at `litellm.litellm.svc.cluster.local:4000`. That
 traffic is cluster-internal; the public tunnels exist for human access, not for
 service-to-service calls.
+
+### Two ways to run the MCP server, and which one is live
+
+The server can be run in either of two modes, and this cluster currently has **both**
+deployed at once.
+
+**Mode A — standalone (`litellm-mcp-server`).** `k8s-deploy.yaml` runs the bare FastMCP
+server with `--host 0.0.0.0 --port 8000`, fronted by Service `litellm-mcp:8000`. One
+init container (`git-clone`), `emptyDir` volumes only, no PVC, `strategy: RollingUpdate`.
+There is no console, no SPA, no proxy and no authentication in front of it — anything
+that can reach the Service can call every registered tool. It is intended for
+in-cluster consumers that already sit behind their own trust boundary.
+
+**Mode B — console-embedded (`litellm-mcp-admin`).** `k8s-admin-deploy.yaml` runs the
+admin console on `0.0.0.0:8080` and the console *spawns its own FastMCP child* as a
+subprocess bound to `127.0.0.1:3000`. The child is written into `/data/config.json` by
+the `seed-config` init container:
+
+```json
+"mcp_server": {
+  "command": "python",
+  "args": ["-m", "woow_litellm_mcp_server.server",
+           "--transport", "http", "--host", "127.0.0.1",
+           "--port", "3000", "--path", "/mcp/"],
+  "port": 3000
+}
+```
+
+The console's encrypted proxy at `/private_{mcp_auth_token}/mcp/` is the only path to
+that child. **The console does not talk to `litellm-mcp:8000`** — Mode B is entirely
+self-contained, which is why "the console contains the server" is an accurate
+description of Mode B and a wrong description of the namespace as a whole.
+
+**What is actually serving.** The Cloudflare tunnel in namespace `litellm` is a
+remotely-managed (token) tunnel, so its ingress rules live in the Cloudflare dashboard
+rather than in a ConfigMap. `cloudflared`'s own logs name the origin explicitly:
+
+```
+ingressRule=1 originService=http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080
+dest=https://litellm-mcp.woowtech.io/private_…/mcp
+```
+
+So public MCP traffic terminates on `litellm-mcp-admin:8080` → loopback `:3000`. No
+ingress rule points at `litellm-mcp:8000`; the standalone Deployment's last inbound
+request from anything other than its own pod was a manual in-cluster probe. **It is
+running, healthy and idle.** Keep it if you want an unauthenticated in-cluster endpoint;
+otherwise `kubectl delete -f k8s-deploy.yaml`'s Deployment and Service stanzas remove a
+live, unauthenticated surface for zero loss of function.
+
+```
+                            ┌───────────────────────────────────────────┐
+  Internet ──► Cloudflare ──►│ Service litellm-mcp-admin :8080           │
+                            │   admin console (SPA + /api/*, JWT)       │
+                            │   /private_{token}/mcp/  ── proxy ──┐      │
+                            │                                     ▼      │
+                            │        FastMCP child 127.0.0.1:3000        │
+                            └──────────────────────┬────────────────────┘
+                                                   │ cluster DNS
+                            ┌──────────────────────▼────────────────────┐
+       (no public route) ──►│ Service litellm-mcp :8000                 │──► litellm:4000
+                            │   standalone FastMCP, no auth, idle       │
+                            └───────────────────────────────────────────┘
+```
 
 ---
 
@@ -25,9 +92,34 @@ starts.
 
 | # | Name | Image | Does |
 |---|---|---|---|
-| 1 | `git-clone` | `alpine/git` | Clones this public repo into the `/repo` emptyDir. |
-| 2 | `spa-build` | `node:20-alpine` | `npm ci && npm run build` in `frontend/`. **Ends in `exit 0`.** |
-| 3 | `seed-config` | `python:3.12-slim` | Seeds `/data/config.json` on the PVC if absent. Idempotent. |
+| 1 | `git-clone` | `alpine/git` | `rm -rf /repo/*` then `git clone --depth 1` this public repo into the `/repo` emptyDir. |
+| 2 | `spa-build` | `node:20-alpine` | `npm install --no-audit --no-fund && npm run build` in `frontend/`, then `cp -r dist/* /repo/static/`. **Ends in `exit 0`.** |
+| 3 | `seed-config` | `python:3.12-slim` | Rewrites the keys it owns in `/data/config.json` on the PVC, `chmod 600`. **Runs on every start — see below.** |
+
+`spa-build` uses `npm install`, not `npm ci`, because `frontend/package-lock.json` is
+not committed (OPEN-2 in [`findings.md`](../findings.md)). Two cold starts of the same
+commit can therefore resolve different dependency versions.
+
+### What `seed-config` actually does
+
+It is **not** "seed only if absent". It runs on every pod start and splits the config
+into keys it owns and keys it preserves:
+
+| Behaviour | Keys |
+|---|---|
+| **Overwritten from the Secret, every start** | `admin_password`, `mcp_auth_token`, `connection.litellm_mcp_base_url`, `connection.litellm_mcp_master_key` |
+| **Overwritten from the manifest, every start** | `mcp_server.command`, `mcp_server.args`, `mcp_server.port` |
+| **Preserved across restarts** | `mcp_server.env` (the `LITELLM_MCP_*` gating switches), `tools.*`, `token_history`, `proxy` |
+
+That distinction has a sharp operational edge: **a password change or a token rotation
+made in the console survives only until the next pod restart.** The console writes the
+new value to `/data/config.json`, and the next `seed-config` run puts the Secret's value
+back. If you change either from the console, update
+`Secret/litellm-mcp-admin-secret` (`ADMIN_PASSWORD`, `MCP_AUTH_TOKEN`) to match, or the
+change will silently revert on the next rollout, node drain or eviction.
+
+The one legacy migration it performs is folding a pre-existing `tools.disabled` list
+into `tools.disabled_tools` and dropping the old key, so a reader never sees both.
 
 The main `admin` container then `pip install`s from `/repo` and launches
 `uvicorn litellm_mcp_admin.main:app --host 0.0.0.0 --port 8080`.
@@ -53,10 +145,14 @@ cp k8s-secret.example.yaml k8s-secret.yaml
 $EDITOR k8s-secret.yaml
 kubectl apply -f k8s-secret.yaml
 
-# 2. Bare MCP server (namespace + deployment + service)
+# 2. Namespace + secret, and the standalone MCP server (Mode A).
+#    Note: k8s-deploy.yaml also creates the namespace and litellm-mcp-secret that
+#    step 3 depends on. If you only want the console (Mode B), apply this file but
+#    delete Deployment/litellm-mcp-server and Service/litellm-mcp afterwards —
+#    the console spawns its own child and never uses them.
 kubectl apply -f k8s-deploy.yaml
 
-# 3. Admin console + encrypted proxy
+# 3. Admin console + encrypted proxy + loopback MCP child (Mode B)
 kubectl apply -f k8s-admin-deploy.yaml
 
 # 4. Watch the init chain
@@ -71,7 +167,9 @@ kubectl port-forward -n litellm-mcp deploy/litellm-mcp-admin 8080:8080
 ```
 
 Change the admin password on first login, then set the gateway target on the Connection
-page and probe it.
+page and probe it. On k3s, also change `ADMIN_PASSWORD` in
+`Secret/litellm-mcp-admin-secret` to the same value — otherwise `seed-config` restores
+the old password on the next pod start (see above).
 
 ---
 
@@ -91,10 +189,28 @@ Rotating is instantaneous and breaks every connected client. The procedure:
 
 1. Note which clients are connected.
 2. Rotate on the Tokens page.
-3. Repoint each client to the new URL.
+3. **Write the new token into `Secret/litellm-mcp-admin-secret` key `MCP_AUTH_TOKEN`.**
+   Skip this and `seed-config` reverts the token on the next pod start, silently
+   breaking the clients you just repointed.
+4. Repoint each client to the new URL.
 
 `POST /api/tokens/generate` previews a candidate without committing it; only
 `POST /api/tokens/rotate` writes. Keep that distinction in mind when scripting.
+
+### The token is visible at the edge
+
+The token is part of the URL path, so anything that logs a request line logs the token.
+The proxy strips the private prefix before the inner request is logged, which keeps it
+out of the console's own log ring buffer — but `cloudflared` logs the full destination
+URL, including the token, on every origin error:
+
+```
+ERR Request failed … dest=https://litellm-mcp.woowtech.io/private_<token>/mcp
+```
+
+Treat tunnel logs, edge analytics and any reverse-proxy access log in the path as
+containing a live credential. This is a property of putting the secret in the URL at all
+and is discussed in [`architecture.md` §4](./architecture.md#4-why-the-token-lives-in-the-path).
 
 ---
 
@@ -116,9 +232,15 @@ stays logged in.
 ## Health checks
 
 ```bash
+# Both deployments in the namespace — expect litellm-mcp-admin and, if Mode A is
+# still deployed, litellm-mcp-server
+kubectl get deploy,svc,pods -n litellm-mcp
+
 # Pod and container state
-kubectl get pods -n litellm-mcp
 kubectl logs -n litellm-mcp deploy/litellm-mcp-admin -c admin --tail=100
+
+# Which origin the tunnel is actually dialling
+kubectl logs -n litellm deploy/cloudflared --tail=200 | grep originService
 
 # Init container logs — this is the only place an SPA build failure appears
 kubectl logs -n litellm-mcp deploy/litellm-mcp-admin -c spa-build

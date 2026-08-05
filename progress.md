@@ -128,7 +128,7 @@ The tool table in `README.md` and `docs/tool-catalog.md` was generated from
 | `2829b2e` | `README_zh-TW.md` |
 | `23e2821` | `docs/architecture.md`, `docs/tool-catalog.md`, `docs/deployment.md`, `docs/screenshots/README.md` |
 | `4823d68` | `task_plan.md`, `findings.md` |
-| this one | `progress.md` |
+| `5972c18` | `progress.md` |
 
 - [x] Tree verified against `origin/main`. All fifteen binaries carry byte sizes
   identical to the Phase 2 capture table above; the four supplementary documents and
@@ -145,6 +145,39 @@ The tool table in `README.md` and `docs/tool-catalog.md` was generated from
   fixture in `tests/test_admin_tools_api.py`. No live credential is in the tree.
 - [x] Credential-rotation advisory delivered — recorded as OPEN-4 in
   [`findings.md`](./findings.md).
+
+---
+
+## Phase 5 — Topology audit against the live cluster · complete
+
+Prompted by a challenge to the published claim that the suite is a single Deployment
+with the server inside the console. Every step below is a read; nothing was modified.
+
+| # | Query | Result |
+|---|---|---|
+| 1 | Deployments in `litellm-mcp` | **Two** — `litellm-mcp-admin` (12 h, container `admin`) and `litellm-mcp-server` (19 h, container `mcp-server`), both `python:3.12-slim`, both `1/1` |
+| 2 | Pods in `litellm-mcp` | `litellm-mcp-admin-749b47fb6c-zm9zg` and `litellm-mcp-server-5bbb4d67d-zwbbm`, 0 restarts each, same node |
+| 3 | Services in `litellm-mcp` | **Two** — `litellm-mcp` → `10.43.212.98:8000`, selector `app=litellm-mcp-server`; `litellm-mcp-admin` → `10.43.111.31:8080`, selector `app=litellm-mcp-admin` |
+| 4 | `Deployment/litellm-mcp-server` spec | `RollingUpdate`, one `git-clone` init container, `--host 0.0.0.0 --port 8000`, `emptyDir` only, no PVC, no SPA |
+| 5 | `Deployment/litellm-mcp-admin` spec | `Recreate`, three init containers, PVC `litellm-mcp-data`, uvicorn on `0.0.0.0:8080`; `seed-config` writes `mcp_server` pointing at `127.0.0.1:3000` |
+| 6 | `/data/config.json` on the admin pod | `mcp_server.args` = `--host 127.0.0.1 --port 3000`; `proxy.timeout` 86400; all four gates empty |
+| 7 | `cloudflared` logs in `litellm` | `ingressRule=1 originService=http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080` for `litellm-mcp.woowtech.io` |
+| 8 | In-cluster probes | `litellm-mcp:8000/mcp/` → 406, `127.0.0.1:3000/mcp/` → 406, `127.0.0.1:8080/healthz` → 200. All three live |
+| 9 | `Deployment/litellm-mcp-server` logs | Last inbound request before the deliberate probe: 2026-08-04 17:04 from `127.0.0.1`. No external traffic |
+
+**Verdict.** "Console contains the server" is true of `litellm-mcp-admin` and true of
+the entire public path. "Single Deployment" is false: a second, standalone,
+unauthenticated MCP server is running alongside it and carrying no traffic.
+
+Four documentation defects fell out of this and are recorded in
+[`findings.md`](./findings.md) as FINDING-003 through FINDING-006, with OPEN-5 and
+OPEN-6 as the two decisions left to the operator. Corrections pushed to
+`docs/deployment.md`, `docs/architecture.md` (new §9 and a narrowed §4 claim),
+`findings.md` and this file.
+
+The repository manifests themselves were checked against the live specs and match
+exactly — `k8s-deploy.yaml` and `k8s-admin-deploy.yaml` are accurate. The defect was in
+the prose, not the YAML.
 
 ---
 

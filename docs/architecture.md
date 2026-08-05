@@ -131,6 +131,23 @@ A mismatched token returns `404`, identical to a nonexistent path. Probing there
 reveals nothing: an attacker cannot distinguish "wrong token" from "no such endpoint",
 so the endpoint's existence is not confirmable without the token itself.
 
+**The limit of that argument.** Stripping the prefix protects the *inner* log — the one
+this project owns and streams to the console. It does nothing about logs upstream of the
+proxy. The Cloudflare tunnel in front of the live deployment writes the full destination
+URL, token included, into `cloudflared`'s own log whenever an origin request fails:
+
+```
+ERR Request failed … dest=https://litellm-mcp.woowtech.io/private_<token>/mcp
+```
+
+That is not a bug in cloudflared; it is the unavoidable consequence of making the secret
+part of the URL. Every hop that sees a request line sees the credential. The honest
+statement of the design is therefore narrower than "the token does not reach the log
+buffer": the token does not reach *our* log buffer, and any operator running this behind
+an edge proxy must treat that proxy's logs as credential material. If the client
+supports headers, an `Authorization` header remains strictly better; the path form is a
+compatibility concession, not a security improvement.
+
 ---
 
 ## 5. Process supervision
@@ -204,6 +221,41 @@ Keeping them in separate namespaces means the MCP suite can be redeployed, resta
 broken without touching the gateway. That separation is load-bearing: the gateway serves
 production model traffic, and an experimental change to the MCP layer must not be able
 to take it down.
+
+---
+
+## 9. Two deployment modes, and why both exist
+
+The MCP server is packaged so it can run either bare or embedded, and the two manifests
+in the repository root correspond exactly to those two modes.
+
+**Mode A, standalone** (`k8s-deploy.yaml` → Deployment `litellm-mcp-server`, Service
+`litellm-mcp:8000`) binds `0.0.0.0:8000` and is nothing but the FastMCP server. No
+console, no proxy, no authentication. It exists because an in-cluster consumer that
+already sits inside a trust boundary should not have to pay for a GUI, a PVC and a
+three-step init chain to get 40 tools over Streamable-HTTP.
+
+**Mode B, console-embedded** (`k8s-admin-deploy.yaml` → Deployment `litellm-mcp-admin`,
+Service `litellm-mcp-admin:8080`) runs the console, and the console spawns its own child
+server on `127.0.0.1:3000` through `mcp_admin_core/process.py`. The child's command line
+is stored in `/data/config.json`, not in the manifest, which is what lets the Settings
+page restart it and the Permissions page change its gates without a pod rollout.
+
+The consequence people get wrong: **Mode B does not consume Mode A.** The console never
+dials `litellm-mcp:8000`. Deploying both, as the live cluster currently does, gives you
+two independent server processes reading the same registry and the same gateway — the
+loopback one behind the token-gated proxy, and a second one on a ClusterIP with no
+authentication in front of it at all.
+
+That is a defensible configuration only if you intend the unauthenticated in-cluster
+endpoint. If you do not, Mode A is not redundancy, it is an extra attack surface:
+identical capability, none of the gating. The decision belongs in the manifest, not in
+whatever happened to be applied first.
+
+Binding the Mode B child to loopback rather than `0.0.0.0` is what makes the distinction
+enforceable. A child on `0.0.0.0:3000` inside the admin pod would be reachable by
+anything that could reach the pod IP, and the proxy's token check would become advisory.
+Loopback makes the proxy the only door, by construction rather than by policy.
 
 ---
 

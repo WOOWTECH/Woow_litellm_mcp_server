@@ -56,13 +56,13 @@ ticket — that field contains the full private URL, token included. See
 [the token is visible at the edge](#the-token-is-visible-at-the-edge).)
 
 ```
-                            ┌───────────────────────────────────────┐
+                            ┌───────────────────────────────────────────┐
   Internet ──► Cloudflare ──►│ Service litellm-mcp-admin :8080           │
                             │   admin console (SPA + /api/*, JWT)       │
                             │   /private_{token}/mcp/  ── proxy ──┐      │
                             │                                     ▼      │
                             │        FastMCP child 127.0.0.1:3000        │──► litellm:4000
-                            └───────────────────────────────────────┘
+                            └───────────────────────────────────────────┘
                                                                             cluster DNS
 ```
 

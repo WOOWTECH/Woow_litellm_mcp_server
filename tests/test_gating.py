@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from woow_litellm_mcp_server.errors import ToolError
 from woow_litellm_mcp_server.gating import ToolGate
 from woow_litellm_mcp_server.registry import (
     OP_READ,
@@ -9,6 +12,7 @@ from woow_litellm_mcp_server.registry import (
     TOOLS_BY_NAME,
     ToolCategory,
 )
+from woow_litellm_mcp_server.settings import Settings
 
 from .conftest import build_gate, register_all
 
@@ -89,3 +93,119 @@ def test_unknown_tool_is_never_enabled() -> None:
     gate = build_gate()
     assert not gate.is_tool_enabled("litellm_does_not_exist")
     assert "litellm_does_not_exist" not in TOOLS_BY_NAME
+
+
+# --- rule 4: operation gates are actually enforced -------------------------
+def test_disabling_a_tools_only_operation_removes_the_tool() -> None:
+    """`disabled_operations` used to be decorative: parsed, then ignored.
+
+    A tool whose every declared operation is disabled must disappear from the
+    surface, not stay registered and happily perform the disabled operation.
+    """
+    gate = build_gate(disabled_operations=["litellm_delete_key:delete"])
+    assert gate.allowed_operations("litellm_delete_key") == ()
+    assert not gate.is_tool_enabled("litellm_delete_key")
+    assert "litellm_delete_key" not in register_all(gate).tools
+    # A sibling with a different operation is untouched.
+    assert gate.is_tool_enabled("litellm_generate_key")
+
+
+def test_readonly_removes_every_mutating_tool_not_just_dangerous_ones() -> None:
+    """Read-only leaves only `read` operations, so nothing mutating survives."""
+    gate = build_gate(readonly=True)
+    for name in gate.enabled_tool_names():
+        assert TOOLS_BY_NAME[name].operations == (OP_READ,), name
+    assert not gate.is_tool_enabled("litellm_update_key")  # mutating, not dangerous
+
+
+def test_require_operation_refuses_at_call_time() -> None:
+    """Second line of defence inside the tool body, with a readable reason."""
+    gate = build_gate(disabled_operations=["update"])
+    gate.require_operation("litellm_key_info", OP_READ)  # allowed -> no raise
+    with pytest.raises(ToolError) as exc:
+        gate.require_operation("litellm_update_key", "update")
+    assert "litellm_update_key" in str(exc.value)
+    assert "operation policy" in str(exc.value)
+
+    ro = build_gate(readonly=True)
+    with pytest.raises(ToolError) as exc:
+        ro.require_operation("litellm_update_key", "update")
+    assert "read-only" in str(exc.value)
+
+
+# --- Settings env parsing is what feeds the gate in production -------------
+def test_settings_parses_json_and_csv_env_forms() -> None:
+    """The admin writes JSON; humans write CSV. Both must reach the gate."""
+    json_cfg = Settings(
+        disabled_tools='["litellm_delete_key", "litellm_block_key"]',
+        disabled_categories='["chat"]',
+        disabled_operations='{"litellm_update_key": ["update"]}',
+    )
+    assert json_cfg.disabled_tools == ["litellm_delete_key", "litellm_block_key"]
+    assert json_cfg.disabled_categories == ["chat"]
+    assert ToolGate(json_cfg).allowed_operations("litellm_update_key") == ()
+
+    csv_cfg = Settings(
+        disabled_tools="litellm_delete_key, litellm_block_key",
+        disabled_operations="delete, litellm_update_key:update",
+    )
+    assert csv_cfg.disabled_tools == ["litellm_delete_key", "litellm_block_key"]
+    assert not ToolGate(csv_cfg).is_tool_enabled("litellm_delete_team")
+
+
+def test_settings_degrades_bad_values_instead_of_raising() -> None:
+    """A raise here kills the MCP child process at import time.
+
+    pydantic-settings would json-decode these fields itself and explode on a
+    malformed value before our validator ever ran; NoDecode + this validator
+    turn "operator typo" into "no switches applied" instead of "server dead".
+    """
+    cfg = Settings(
+        disabled_tools="[broken",
+        disabled_categories='{"not": ',
+        disabled_operations="[oops",
+    )
+    assert cfg.disabled_tools == []
+    assert cfg.disabled_categories == []
+    assert cfg.disabled_operations == []
+    assert set(ToolGate(cfg).enabled_tool_names()) == {s.name for s in TOOL_REGISTRY}
+
+
+def test_settings_accepts_already_parsed_values() -> None:
+    cfg = Settings(
+        disabled_tools=["litellm_delete_key"],
+        disabled_operations={"litellm_update_key": ["update"]},
+    )
+    assert cfg.disabled_tools == ["litellm_delete_key"]
+    assert cfg.disabled_operations == {"litellm_update_key": ["update"]}
+    gate = ToolGate(cfg)
+    assert not gate.is_tool_enabled("litellm_delete_key")
+    assert gate.allowed_operations("litellm_update_key") == ()
+
+
+def test_settings_env_round_trip(monkeypatch) -> None:
+    """The exact env shape the admin writes into the child process."""
+    monkeypatch.setenv("LITELLM_MCP_READONLY", "true")
+    monkeypatch.setenv("LITELLM_MCP_DISABLED_TOOLS", '["litellm_list_models"]')
+    monkeypatch.setenv("LITELLM_MCP_DISABLED_CATEGORIES", '["chat"]')
+    monkeypatch.setenv(
+        "LITELLM_MCP_DISABLED_OPERATIONS", '{"litellm_key_info": ["read"]}'
+    )
+    cfg = Settings()
+    assert cfg.readonly is True
+    assert cfg.disabled_tools == ["litellm_list_models"]
+    gate = ToolGate(cfg)
+    assert not gate.is_tool_enabled("litellm_list_models")
+    assert not gate.is_tool_enabled("litellm_key_info")
+
+
+def test_settings_singleton_is_lazy() -> None:
+    """`settings` is materialised on attribute access, not at import.
+
+    Building it at import time meant any env/validation problem crashed the
+    child before FastMCP could report anything.
+    """
+    import woow_litellm_mcp_server.settings as settings_mod
+
+    assert "settings" not in vars(settings_mod)
+    assert isinstance(settings_mod.settings, Settings)

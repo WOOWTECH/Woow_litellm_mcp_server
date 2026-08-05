@@ -66,18 +66,40 @@ st, err = search(level='error,warning', limit=5000)
 check('Logs: level=error,warning returns only those levels',
       st == 200 and set(json.loads(x)['level'] for x in err.get('lines', [])) <= {'error','warning'},
       sorted({json.loads(x)['level'] for x in err.get('lines', [])}))
-# Compare against a baseline read AFTER the filtered one, never the snapshot
-# taken at the top of this file. Every request this suite makes writes its own
-# uvicorn access line, so the ring buffer grows throughout the run: the opening
-# unfiltered count was already stale by the time the level filter ran, and the
-# info-only count legitimately exceeded it. Reading the unfiltered total second
-# makes it a guaranteed superset of what the filter saw, and the non-info lines
-# inside that same response are the proof that the filter removed something.
+# Two things this check must not assume, both of which it used to.
+#
+# 1. That the baseline taken at the top of this file is still current. Every
+#    request the suite makes writes its own uvicorn access line, so the ring
+#    buffer grows throughout the run and the info-only count legitimately
+#    exceeded a baseline read a hundred requests earlier. Read the unfiltered
+#    total AFTER the filtered one: the buffer only grows, so the later read is
+#    a guaranteed superset of whatever the filter saw.
+# 2. That the buffer contains a non-info line at all. On a freshly restarted
+#    pod every line is 'info' — the warnings this leaned on are "MCP server
+#    exited", which only the settings suite provokes — so "info is strictly
+#    fewer than everything" is not a property that holds at all times, and
+#    asserting it failed for reasons unrelated to the filter.
+#
+# So: bound the info count by the unfiltered total (always true, race-free),
+# and prove narrowing separately with a level the snapshot shows is absent.
+# That works no matter what the buffer happens to contain.
 st, allnow = search(limit=5000)
-noninfo = [l for l in (json.loads(x) for x in allnow.get('lines', [])) if l['level'] != 'info']
-check('Logs: a level filter actually narrows the buffer',
-      bool(noninfo) and inf.get('count', 0) < allnow.get('count', 0),
-      (inf.get('count'), allnow.get('count'), len(noninfo)))
+snapshot = [json.loads(x) for x in allnow.get('lines', [])]
+present = {l['level'] for l in snapshot}
+absent = [lv for lv in ('critical', 'error', 'debug', 'warning') if lv not in present]
+check('Logs: level=info never returns more than the unfiltered buffer',
+      inf.get('count', 0) <= allnow.get('count', 0),
+      (inf.get('count'), allnow.get('count')))
+if absent:
+    st, gone = search(level=absent[0], limit=5000)
+    check('Logs: a level filter actually narrows the buffer (level=%s)' % absent[0],
+          st == 200 and gone.get('count', 0) < allnow.get('count', 0),
+          (absent[0], gone.get('count'), allnow.get('count')))
+else:
+    # Every known level is represented, so info-only must be strictly smaller.
+    check('Logs: a level filter actually narrows the buffer',
+          inf.get('count', 0) < allnow.get('count', 0),
+          (inf.get('count'), allnow.get('count'), sorted(present)))
 st, alias = search(level='warn')
 check('Logs: the "warn" alias is accepted', st == 200, st)
 st, typo = search(level='eror')

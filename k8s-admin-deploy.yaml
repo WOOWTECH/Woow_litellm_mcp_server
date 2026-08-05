@@ -29,11 +29,36 @@
 # stateful Streamable-HTTP flow works end to end. Rotate the token from the
 # console (POST /api/tokens/rotate) — the old URL dies immediately.
 #
-# Apply order:
+# Apply order, FIRST INSTALL ONLY:
 #   kubectl apply -f k8s-base.yaml           # namespace + litellm-mcp-secret
 #   kubectl apply -f k8s-admin-deploy.yaml   # this file
 #
 # Secrets: PLACEHOLDERS ONLY. Never commit real values.
+#
+# ---------------------------------------------------------------------------
+# RE-APPLYING TO A LIVE CLUSTER — read this first.
+#
+# This is a bootstrap manifest, not a reconciliation target. The first document
+# below is Secret/litellm-mcp-admin-secret with PLACEHOLDER credentials, so on a
+# cluster that is already running,
+#
+#     kubectl apply -f k8s-admin-deploy.yaml     # <-- DESTRUCTIVE
+#
+# resets ADMIN_PASSWORD, MCP_AUTH_TOKEN and JWT_SECRET to the literal strings
+# "REPLACE_ME…", locking you out of the console and breaking every client bound
+# to the current /private_{token}/mcp/ URL. Apply the Deployment alone instead:
+#
+#     python - <<'PY' > /tmp/deploy.yaml
+#     print(open('k8s-admin-deploy.yaml').read().split('\n---\n')[2])
+#     PY
+#     kubectl apply -f /tmp/deploy.yaml
+#
+# Before doing so, check that Secret/litellm-mcp-admin-secret still agrees with
+# /data/config.json. A pod running a pre-FINDING-004 manifest rebuilt the config
+# from the Secret on every start, so if the two have drifted the Recreate will
+# flip the live mcp_auth_token and kill connected clients. Compare by digest, not
+# by value. Back up /data/config.json first; expect ~3 minutes of downtime.
+# ---------------------------------------------------------------------------
 # =============================================================================
 
 apiVersion: v1

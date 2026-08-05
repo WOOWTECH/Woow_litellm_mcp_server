@@ -25,6 +25,62 @@ from .config import get_config_store
 
 logger = logging.getLogger(__name__)
 
+# The FastMCP child needs 10-14s to import and bind in production, so anything
+# shorter turns a healthy start into a "not ready" report.
+_READY_TIMEOUT = 30.0
+_READY_POLL_INTERVAL = 0.5
+_READY_CONNECT_TIMEOUT = 1.0
+
+
+def _inject_port(args: list[str], port: int | None) -> list[str]:
+    """Make ``mcp_server.port`` authoritative for the child's bind port.
+
+    The command line used to be passed through verbatim while the reverse proxy
+    dialled ``mcp_server.port``, so the GUI's Port field was decorative: change
+    it and the proxy started calling a port nothing was listening on.  Here the
+    stored port overrides an existing ``--port`` and is appended when the child
+    is clearly an HTTP server but was given no port at all.  A stdio child gets
+    nothing — it has no port to bind.
+    """
+    if not port:
+        return list(args)
+
+    argv = list(args)
+    if "stdio" in argv:  # --transport stdio: no listener, nothing to inject
+        return argv
+
+    for index, arg in enumerate(argv):
+        if arg == "--port":
+            if index + 1 < len(argv):
+                argv[index + 1] = str(port)
+                return argv
+            return argv + [str(port)]
+        if arg.startswith("--port="):
+            argv[index] = f"--port={port}"
+            return argv
+
+    # Only append for a command line that already looks like an HTTP server;
+    # an unknown child would reject an argument it does not define.
+    if any(a in ("--host", "--transport") or a.startswith(("--host=", "--transport=")) for a in argv):
+        return argv + ["--port", str(port)]
+    return argv
+
+
+async def _port_accepts_connections(port: int) -> bool:
+    """True if something is listening on 127.0.0.1:*port*."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=_READY_CONNECT_TIMEOUT
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (OSError, asyncio.TimeoutError):
+        pass
+    return True
+
 
 class McpProcessManager:
     """Manage the MCP server as an asyncio subprocess."""
@@ -33,6 +89,10 @@ class McpProcessManager:
         self._process: asyncio.subprocess.Process | None = None
         self._running = False
         self._restart_count = 0
+        # Port the *current* child was told to bind, and whether it binds one
+        # at all (a stdio child never does).  Set at start() from the config.
+        self._port: int | None = None
+        self._expects_port = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -52,8 +112,18 @@ class McpProcessManager:
             logger.warning("No MCP server command configured — skipping start")
             return False
 
-        args = mcp_cfg.get("args", [])
+        args = list(mcp_cfg.get("args", []) or [])
         env_overrides = mcp_cfg.get("env", {})
+
+        try:
+            port = int(mcp_cfg.get("port") or 0) or None
+        except (TypeError, ValueError):
+            port = None
+        args = _inject_port(args, port)
+        # The proxy dials this port; remember what we actually told the child
+        # to bind so status()/wait_ready() probe the same address.
+        self._expects_port = bool(port) and "stdio" not in args
+        self._port = port if self._expects_port else None
 
         # Build connection env from config
         connection = await store.get("connection", {})
@@ -116,34 +186,85 @@ class McpProcessManager:
         logger.info("MCP server stopped")
 
     async def restart(self) -> bool:
-        """Stop then start the MCP server.  Returns True if restarted."""
+        """Stop then start the MCP server, waiting until it accepts connections.
+
+        Returns True only when the child is actually serving.  A bare "process
+        started" answer used to come back in 0.3s while the connector kept
+        returning 502 for another 10-14s, so every save reported success on an
+        outage it had just caused.
+        """
         await self.stop()
         self._restart_count += 1
-        return await self.start()
+        if not await self.start():
+            return False
+        return await self.wait_ready()
+
+    # ------------------------------------------------------------------
+    # Readiness
+    # ------------------------------------------------------------------
+
+    async def is_ready(self) -> bool:
+        """True when the child is up *and* accepting connections on its port."""
+        if not self.is_running:
+            return False
+        if not self._expects_port or not self._port:
+            # A stdio child has no listener; liveness is all we can observe.
+            return True
+        return await _port_accepts_connections(self._port)
+
+    async def wait_ready(self, timeout: float = _READY_TIMEOUT) -> bool:
+        """Poll until the child serves, it dies, or *timeout* elapses."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            if not self.is_running:
+                return False
+            if await self.is_ready():
+                return True
+            if loop.time() >= deadline:
+                logger.warning(
+                    "MCP server still not accepting connections on port %s after %.0fs",
+                    self._port,
+                    timeout,
+                )
+                return False
+            await asyncio.sleep(_READY_POLL_INTERVAL)
 
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
     async def status(self) -> dict[str, Any]:
-        """Return current process status."""
+        """Return current process status.
+
+        ``running`` is process liveness, ``ready`` is "serving".  They differ
+        while the child is starting up and for a child that is alive but
+        wedged — reporting only ``running`` made the GUI claim health during
+        the restart window in which the connector answered 502.
+        """
         store = get_config_store()
         mcp_cfg = await store.get("mcp_server", {})
+        port = self._port or mcp_cfg.get("port", 8000)
 
         if self._process and self._process.returncode is None:
+            ready = await self.is_ready()
             return {
                 "running": True,
+                "ready": ready,
+                "state": "running" if ready else "starting",
                 "pid": self._process.pid,
                 "restart_count": self._restart_count,
                 "command": mcp_cfg.get("command", ""),
-                "port": mcp_cfg.get("port", 8000),
+                "port": port,
             }
         return {
             "running": False,
+            "ready": False,
+            "state": "exited" if self._process else "stopped",
             "pid": None,
             "restart_count": self._restart_count,
             "command": mcp_cfg.get("command", ""),
-            "port": mcp_cfg.get("port", 8000),
+            "port": port,
             "exit_code": self._process.returncode if self._process else None,
         }
 

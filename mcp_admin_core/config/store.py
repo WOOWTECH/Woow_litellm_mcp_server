@@ -18,10 +18,15 @@ The config file has this structure::
         "litellm_mcp_base_url": "http://litellm.litellm.svc.cluster.local:4000",
         "litellm_mcp_master_key": "sk-..."
       },
-      "tools": { "disabled": [], "disabled_operations": {} },
+      "tools": {
+        "readonly": false,
+        "disabled_categories": [], "disabled_tools": [],
+        "disabled_operations": {},
+        "permissions": {"allowed_tools": ["*"], "denied_tools": []}
+      },
       "mcp_server": { "command": "...", "port": 8000, "env": { ... } },
       "proxy": { "timeout": 86400 },
-      "token_history": []
+      "token_history": [{"masked": "abcd…", "rotated_at": "<ISO8601 UTC>"}]
     }
 """
 
@@ -38,14 +43,43 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = "/data/config.json"
 
-# Default config seeded on first run
+
+def mask_secret(value: str | None) -> str:
+    """Mask a secret for display, leaking at most four leading characters.
+
+    The canonical masking implementation for everything this package echoes
+    back to the browser (``litellm_mcp_admin.store.mask_secret`` is the same
+    function for the product layer — the two MUST stay byte-identical, a GET
+    masked one way and a PUT that compares against the other way would silently
+    overwrite the stored secret with a mask).  A longer prefix — or any
+    trailing fragment — is enough to recognise a key in a screenshot or a
+    pasted support ticket, and the old ``a1****…**yz`` form additionally leaked
+    the exact length.  Values of 8 characters or fewer are hidden entirely.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    return f"{text[:4]}…" if len(text) > 8 else "…"
+
+
+# Default config seeded on first run.
+#
+# The ``tools`` section is the canonical shape the tool gate actually reads
+# (``disabled_tools``/``disabled_categories``/``readonly``).  It used to be
+# seeded as ``{"disabled": [], …}``, a key nothing reads, so an operator who
+# copied the on-disk shape switched tools off that stayed fully callable.
 _DEFAULT_CONFIG: dict[str, Any] = {
     "admin_password": "admin",
     "mcp_auth_token": "",
     "connection": {},
     "tools": {
-        "disabled": [],
+        "readonly": False,
+        "disabled_categories": [],
+        "disabled_tools": [],
         "disabled_operations": {},
+        # ``allowed_tools`` is an ALLOWLIST: ``["*"]`` (or a missing key) means
+        # "no allowlist"; ``[]`` means "allow nothing" and must fail closed.
+        "permissions": {"allowed_tools": ["*"], "denied_tools": []},
     },
     "mcp_server": {
         "command": "",

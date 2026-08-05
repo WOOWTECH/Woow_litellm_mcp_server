@@ -349,7 +349,7 @@ flowchart LR
             I3["seed-config<br/>python:3.12-slim"]
         end
         D2["Deployment litellm-mcp-admin<br/>strategy: Recreate · :8080"]
-        PVC[("PVC litellm-mcp-data<br;>/data/config.json")]
+        PVC[("PVC litellm-mcp-data<br/>/data/config.json")]
         I1 --> I2 --> I3 --> D2
         PVC --- D2
     end

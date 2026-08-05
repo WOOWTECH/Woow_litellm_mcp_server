@@ -81,9 +81,9 @@ prompt injection 都無法說服模型去呼叫一個不存在的東西。
 從權杖頁輪替之後舊網址會立刻失效。權杖刻意放在路徑而不是 query string —— uvicorn 會把
 完整請求行寫進日誌，放在 query string 的祕密會出現在每一筆存取紀錄裡。
 
-**免 registry 的 Kubernetes 部署。** `k8s-deploy.yaml` 與 `k8s-admin-deploy.yaml` 使用
-`initContainers`（`alpine/git` 負責 clone、`node:20-alpine` 建置 SPA、`python:3.12-slim`
-初始化設定 PVC），所以叢集只會拉取公開的上游映像。冷啟動約兩分半到三分鐘；SPA 建置步驟
+**免 registry 的 Kubernetes 部署。** `k8s-admin-deploy.yaml` 使用三個 `initContainers`
+（`alpine/git` 負責 clone、`node:20-alpine` 建置 SPA、`python:3.12-slim` 初始化設定
+PVC），所以叢集只會拉取公開的上游映像。冷啟動約兩分半到三分鐘；SPA 建置步驟
 刻意以 `exit 0` 結尾，讓前端建置失敗只會讓主控台降級，而不是讓 Pod 陷入重啟迴圈。
 
 **對真實閘道做過實機驗證。** 測試套件帶有一個可選加入的 `live` 標記，會去探測實際部署；
@@ -290,7 +290,8 @@ classDiagram
 
 ### 部署拓撲
 
-兩個 namespace、兩個 Deployment，中間共用一個叢集 DNS 名稱。
+兩個 namespace、兩個 Deployment（閘道一個、MCP 主控台一個），中間共用一個叢集 DNS 名稱。
+`litellm-mcp` namespace 裡只有一個 workload：主控台自己會啟動 MCP 子行程。
 
 ```
   ┌── namespace: litellm ─────────────┐   ┌── namespace: litellm-mcp ──────────────────┐
@@ -371,8 +372,8 @@ flowchart LR
 | **`docs/`** | 補充設計文件與本文件中的所有截圖。 | `architecture.md`、`tool-catalog.md`、`deployment.md`、`encrypted-proxy.md`、`screenshots/` |
 
 部署與封裝相關檔案同樣位於根目錄：`Dockerfile`（兩階段，`node:20-alpine` →
-`python:3.12-slim`，`EXPOSE 8080`）、`docker-compose.yml`、`k8s-deploy.yaml`、
-`k8s-admin-deploy.yaml`、`k8s-secret.example.yaml`、`pyproject.toml`、
+`python:3.12-slim`，`EXPOSE 8080`）、`docker-compose.yml`、`k8s-base.yaml`（namespace 與
+閘道 secret，不含任何 workload）、`k8s-admin-deploy.yaml`（整套主控台）、`pyproject.toml`、
 `mcp_admin_core.pyproject.toml`、`pytest.ini` 與 `.env.example`。
 
 Python 套件合計 **7,206 行**；前端另有 **3,507 行** JSX 與 JS。
@@ -535,9 +536,14 @@ LiteLLM v1.83.14 本身也能註冊 MCP 伺服器，這與本儲存庫是不同�
 
 ## 安裝部署
 
-### 方式一 —— 純 MCP 伺服器
+對外部署只有**一種**形態：管理主控台，它會把 MCP 伺服器當成 loopback 子行程啟動，再透過
+權杖閘控的加密代理對外公開。以下其他選項不是那個形態，就是本機開發用的便利做法。
 
-最小可用的部署：沒有主控台、沒有代理，就是 40 個工具透過 stdio 或 Streamable-HTTP 提供。
+### 方式一 —— 純 MCP 伺服器，僅限本機開發
+
+驗證工具最小的方式：沒有主控台、沒有代理，就是 40 個工具透過 stdio 或 Streamable-HTTP
+提供。**這不是部署路徑。** HTTP 介面前面沒有任何驗證，所以請綁在 loopback，除非你很清楚
+誰能連到你改綁的那個位址。
 
 ```bash
 git clone https://github.com/WOOWTECH/Woow_litellm_mcp_server.git
@@ -547,9 +553,9 @@ pip install .
 export LITELLM_MCP_BASE_URL=http://localhost:4000
 export LITELLM_MCP_MASTER_KEY=sk-...        # 千萬不要 commit
 
-# Streamable-HTTP（線上部署使用的預設）
+# Streamable-HTTP，綁 loopback
 python -m woow_litellm_mcp_server.server \
-  --transport http --host 0.0.0.0 --port 8000 --path /mcp/
+  --transport http --host 127.0.0.1 --port 8000 --path /mcp/
 
 # 或者用 stdio 給本機 MCP 用戶端
 python -m woow_litellm_mcp_server.server --transport stdio
@@ -566,29 +572,19 @@ docker compose up --build
 `uvicorn litellm_mcp_admin.main:app` 在 `:8080` 提供服務。用設定儲存中的 `admin_password`
 登入（預設為 `admin` —— 第一次登入就改掉），在連線頁指向你的閘道，並在工具頁開關工具。
 
-### 方式三 —— Kubernetes，純伺服器
+### 方式三 —— Kubernetes：主控台 + 加密代理 + MCP 子行程
 
-不需要建置映像，也不需要私有 registry：`initContainer` 把這個公開儲存庫 clone 進
-`emptyDir`，主容器再 `pip install` 它。
-
-```bash
-kubectl apply -f k8s-secret.example.yaml   # 填入真實 master key 之後
-kubectl apply -f k8s-deploy.yaml
-```
-
-叢集內的消費端接著可從
-`http://litellm-mcp.litellm-mcp.svc.cluster.local:8000/mcp/` 存取。
-
-### 方式四 —— Kubernetes，主控台 + 加密代理
-
-只套用 `k8s-deploy.yaml` 得到的是一個沒有驗證的裸 MCP 伺服器，它之所以安全只是因為它從不
-離開叢集。要把它公開出去，就再套用 admin manifest —— 同樣的 git-clone 手法，外加 SPA 建置
-與初始化好的設定 PVC。
+這是唯一受支援的正式部署。不需要建置映像，也不需要私有 registry：init container 把這個
+公開儲存庫 clone 進 `emptyDir`、建置 SPA、初始化設定 PVC，主容器再 `pip install .[admin]`
+並在 `:8080` 提供主控台。
 
 ```bash
-kubectl apply -f k8s-deploy.yaml         # namespace + litellm-mcp-secret
-kubectl apply -f k8s-admin-deploy.yaml   # 主控台 + 加密代理 + MCP 子行程
+kubectl apply -f k8s-base.yaml           # namespace + litellm-mcp-secret
+kubectl apply -f k8s-admin-deploy.yaml   # 主控台 + 加密代理 + MCP 子行程 + PVC
 ```
+
+`k8s-base.yaml` 內的祕密只是佔位值，套用前後請立刻換掉；而在已經有真實值的叢集上，請
+**直接跳過這個檔案**，不要用 `sk-REPLACE_ME` 覆蓋掉線上還在用的 master key。
 
 把 Cloudflare 隧道或任何 ingress 指向
 `http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080`，唯一對外的 MCP 門就是
@@ -598,6 +594,20 @@ Cloudflare Bot Fight Mode 注意事項，都寫在
 [`docs/deployment.md`](./docs/deployment.md)。
 
 三個 init container 執行期間，冷啟動約需兩分半到三分鐘。
+
+> **從舊版本升級？** 這個儲存庫過去還有第二份 manifest `k8s-deploy.yaml`，會把同一支伺服器
+> 裸跑在 `0.0.0.0:8000`、掛在 `Service/litellm-mcp` 後面，前面沒有任何驗證；而因為那個檔案
+> 同時帶著共用的 namespace 與 secret，照著文件的套用順序做，無論你要不要都會得到那個沒有
+> 閘控的端點。它已經被移除（見 [`findings.md`](./findings.md) 的 FINDING-003）。既有叢集請
+> 這樣清掉：
+>
+> ```bash
+> kubectl delete deployment litellm-mcp-server -n litellm-mcp
+> kubectl delete service    litellm-mcp        -n litellm-mcp
+> # namespace 與 Secret/litellm-mcp-secret 要保留 —— 主控台兩個都需要。
+> ```
+>
+> 不會損失任何功能：主控台從來沒有連過 `litellm-mcp:8000`，它啟動的是自己的子行程。
 
 ### 連接 MCP 用戶端
 
@@ -654,8 +664,8 @@ Cloudflare 邊緣的 TLS。它**不是**指靜態資料加密：設定儲存是�
 （`chmod 600`）與 API 回應中的祕密遮罩來保護。把這件事講清楚，比用行銷詞彙帶過重要得多。
 
 **祕密永遠不進儲存庫。** LiteLLM master key、salt key 與管理密碼只存在於 Kubernetes
-Secret 與容器環境變數中。`k8s-secret.example.yaml` 只放佔位值。每個設定 API 回應都會遮罩
-祕密欄位，master key 更是唯寫 —— 可設定，永遠讀不回來。
+Secret 與容器環境變數中。`k8s-base.yaml` 與 `k8s-admin-deploy.yaml` 都只放佔位值。每個
+設定 API 回應都會遮罩祕密欄位，master key 更是唯寫 —— 可設定，永遠讀不回來。
 
 **`LITELLM_SALT_KEY` 只能設定一次，永遠不要輪替。** LiteLLM 用它加密資料庫欄位；輪替之後
 所有先前加密的值都會變成無法解密。這是上游閘道的特性而非本專案的，也是這整個技術堆疊中

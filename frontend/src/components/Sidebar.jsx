@@ -1,6 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   LayoutDashboard,
   Wrench,
@@ -10,8 +10,9 @@ import {
   Shield,
   Settings,
   LogOut,
+  Loader2,
 } from 'lucide-react';
-import { apiGet, clearToken } from '../api';
+import { apiGet, logout } from '../api';
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
@@ -23,15 +24,20 @@ const navItems = [
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 
+// This is the LiteLLM build of the shared console, so the correct branding
+// lives here in the SOURCE. It used to carry the other products' titles
+// (including 'EMQX MCP Admin') and relied on a build-time `sed` in the
+// Dockerfile to rewrite them, so any local `npm run build` shipped the wrong
+// product name. Keep this map LiteLLM-only.
 const APP_TITLES = {
   litellm: 'LiteLLM MCP Admin',
-  emqx: 'EMQX MCP Admin',
-  n8n: 'n8n MCP Admin',
-  odoo: 'Odoo MCP Admin',
 };
+const DEFAULT_APP_TITLE = 'LiteLLM MCP Admin';
 
 export default function Sidebar() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const [loggingOut, setLoggingOut] = useState(false);
 
   const { data: health } = useQuery({
     queryKey: ['health'],
@@ -40,11 +46,26 @@ export default function Sidebar() {
   });
 
   const appType = health?.app_type || 'litellm';
-  const appTitle = APP_TITLES[appType] || 'MCP Admin';
+  const appTitle = APP_TITLES[appType] || DEFAULT_APP_TITLE;
 
-  function handleLogout() {
-    clearToken();
-    navigate('/login');
+  // Dropping the localStorage token is only half a logout: the login endpoint
+  // also set an httpOnly cookie that AuthMiddleware accepts on its own, and JS
+  // cannot delete it. POST /api/auth/logout expires that cookie and revokes
+  // every issued JWT; without it the console showed the login form while the
+  // browser still held a live admin session. `logout()` never rejects, so a
+  // dead backend cannot trap the operator in a signed-in shell.
+  async function handleLogout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await logout();
+      // Wipe the cached health/settings/tokens views so the next login does not
+      // flash the previous session's data before refetching.
+      queryClient.clear();
+      navigate('/login', { replace: true });
+    } finally {
+      setLoggingOut(false);
+    }
   }
 
   return (
@@ -84,10 +105,11 @@ export default function Sidebar() {
         )}
         <button
           onClick={handleLogout}
-          className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-gray-500 hover:text-red-400 hover:bg-gray-800 transition-colors w-full"
+          disabled={loggingOut}
+          className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-gray-500 hover:text-red-400 hover:bg-gray-800 disabled:opacity-50 transition-colors w-full"
         >
-          <LogOut size={18} />
-          <span>Logout</span>
+          {loggingOut ? <Loader2 size={18} className="animate-spin" /> : <LogOut size={18} />}
+          <span>{loggingOut ? 'Signing out…' : 'Logout'}</span>
         </button>
       </div>
     </aside>

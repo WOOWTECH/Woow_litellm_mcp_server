@@ -641,6 +641,16 @@ Cloudflare Bot Fight Mode caveat are in
 
 Expect a two-and-a-half to three minute cold start while the three init containers run.
 
+Both commands above are for a **fresh cluster**. `k8s-admin-deploy.yaml` is a bootstrap
+manifest, not a reconciliation target: its first document seeds
+`Secret/litellm-mcp-admin-secret` with placeholders, so re-applying the whole file to a
+running install resets the admin password, the JWT secret and the proxy token to
+`REPLACE_ME…` — locking you out and breaking every connected client. To upgrade a live
+deployment, apply the `Deployment` document alone, following
+[`docs/deployment.md`](./docs/deployment.md#re-applying-to-a-running-cluster). To pick up
+new code from `main` you need no apply at all — `/repo` is re-cloned on every start, so
+`kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp` is enough.
+
 > **Upgrading from an earlier revision?** The repository used to ship a second manifest,
 > `k8s-deploy.yaml`, that ran the server bare on `0.0.0.0:8000` behind `Service/litellm-mcp`
 > with no authentication — and because that file also carried the shared namespace and

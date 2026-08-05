@@ -58,7 +58,15 @@ check('Tools: /api/tools 200', st == 200, st)
 check('Tools: all 40 registry tools listed', tl.get('total') == 40, tl.get('total'))
 check('Tools: 40 enabled with the default open gate',
       tl.get('enabled_count') == 40, tl.get('enabled_count'))
-cats = {c['name'] if isinstance(c, dict) else c for c in (tl.get('categories') or [])}
+# /api/tools groups tools as [{"category": "models", "enabled": …, "tools": […]}]
+# and ToolManager.jsx destructures the same key. An earlier revision of this
+# check read c['name'] and died with a KeyError that aborted the whole suite
+# before the summary printed — so accept either spelling and never raise.
+cats = {
+    (c.get('category') or c.get('name')) if isinstance(c, dict) else c
+    for c in (tl.get('categories') or [])
+}
+cats.discard(None)
 check('Tools: grouped into LiteLLM domains, not generic ones',
       {'models', 'keys'} <= cats, sorted(cats))
 check('Tools: every tool declares its operations',

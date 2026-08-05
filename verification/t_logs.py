@@ -1,5 +1,6 @@
 """Log page end-to-end against the live admin API."""
-import json, time, urllib.request, urllib.parse
+import json, os, sys, time, urllib.request, urllib.parse
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mcpc
 
 P=F=0
@@ -65,7 +66,18 @@ st, err = search(level='error,warning', limit=5000)
 check('Logs: level=error,warning returns only those levels',
       st == 200 and set(json.loads(x)['level'] for x in err.get('lines', [])) <= {'error','warning'},
       sorted({json.loads(x)['level'] for x in err.get('lines', [])}))
-check('Logs: a level filter actually narrows the buffer', inf.get('count', 0) < body.get('count', 0) + 1, (inf.get('count'), body.get('count')))
+# Compare against a baseline read AFTER the filtered one, never the snapshot
+# taken at the top of this file. Every request this suite makes writes its own
+# uvicorn access line, so the ring buffer grows throughout the run: the opening
+# unfiltered count was already stale by the time the level filter ran, and the
+# info-only count legitimately exceeded it. Reading the unfiltered total second
+# makes it a guaranteed superset of what the filter saw, and the non-info lines
+# inside that same response are the proof that the filter removed something.
+st, allnow = search(limit=5000)
+noninfo = [l for l in (json.loads(x) for x in allnow.get('lines', [])) if l['level'] != 'info']
+check('Logs: a level filter actually narrows the buffer',
+      bool(noninfo) and inf.get('count', 0) < allnow.get('count', 0),
+      (inf.get('count'), allnow.get('count'), len(noninfo)))
 st, alias = search(level='warn')
 check('Logs: the "warn" alias is accepted', st == 200, st)
 st, typo = search(level='eror')

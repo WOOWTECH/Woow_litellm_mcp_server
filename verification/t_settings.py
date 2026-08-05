@@ -140,13 +140,24 @@ try:
           now == stored_master)
 
     # 9 -- settings sections round-trip ------------------------------------
-    mcpc.api('/api/settings/proxy', {'value': {'timeout': 1234}}, method='PUT')
+    # PUT /api/settings/{section} takes the section's own keys at the top level,
+    # exactly as GET returns them. Wrapping them in {"value": …} — which this
+    # check used to do — is an extra key, and _ProxyPatch forbids extras, so the
+    # write was a 422 that the assertion never looked at and the read then
+    # reported the untouched stored value. Assert the status too, so a rejected
+    # write can never again masquerade as a persistence failure.
+    st, _ = mcpc.api('/api/settings/proxy', {'timeout': 1234}, method='PUT')
+    check('Settings: a proxy section edit is accepted', st == 200, st)
     st, sec = mcpc.api('/api/settings/proxy')
-    ok = json.dumps(sec).find('1234') >= 0
-    check('Settings: a proxy section edit persists', ok, json.dumps(sec)[:200])
-    mcpc.api('/api/settings/proxy', {'value': {'timeout': 86400}}, method='PUT')
+    check('Settings: a proxy section edit persists', sec.get('timeout') == 1234,
+          json.dumps(sec)[:200])
+    # An unknown key must be refused rather than persisted as junk the GUI can
+    # never clear again.
+    st, _ = mcpc.api('/api/settings/proxy', {'tiemout': 1234}, method='PUT')
+    check('Settings: a typo\'d section key is rejected, not stored', st == 422, st)
+    st, _ = mcpc.api('/api/settings/proxy', {'timeout': 86400}, method='PUT')
     st, sec = mcpc.api('/api/settings/proxy')
-    check('Settings: the proxy section restores', '86400' in json.dumps(sec),
+    check('Settings: the proxy section restores', sec.get('timeout') == 86400,
           json.dumps(sec)[:200])
 finally:
     mcpc.api('/api/config/permissions', {'permissions': ORIG_PERMS}, method='PUT')

@@ -57,7 +57,7 @@ function sameOps(a, b) {
     (key) =>
       Array.isArray(b[key]) &&
       a[key].length === b[key].length &&
-      [...a[key]].sort().join('\\u0000') === [...b[key]].sort().join('\\u0000')
+      [...a[key]].sort().join('\u0000') === [...b[key]].sort().join('\u0000')
   );
 }
 

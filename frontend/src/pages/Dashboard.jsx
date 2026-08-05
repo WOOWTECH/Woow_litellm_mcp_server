@@ -110,11 +110,15 @@ export default function Dashboard() {
           subtitle="Prisma / Postgres readiness"
           icon={Database}
         />
+        {/* /v1/models returns distinct public model *names*, so several
+            deployments behind one name are reported as one. The card used to
+            say "Deployments", which under-reports as soon as a model group has
+            more than one backing deployment. */}
         <StatusCard
           title="Models"
           status={gateway.model_count > 0 ? 'green' : 'gray'}
           value={gateway.model_count != null ? String(gateway.model_count) : 'N/A'}
-          subtitle="Deployments registered in the gateway"
+          subtitle="Model groups exposed by the gateway"
           icon={Boxes}
         />
       </div>

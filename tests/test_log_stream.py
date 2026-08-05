@@ -161,6 +161,69 @@ def test_supervisor_lifecycle_lines_are_captured() -> None:
     assert supervisor and supervisor[0]["source"] == "supervisor"
 
 
+async def test_idle_stream_emits_a_ping_heartbeat(monkeypatch) -> None:
+    """An idle SSE stream must keep talking or a proxy/tunnel cuts it.
+
+    This is deliberately unit-tested rather than probed in production: the
+    deployment's readiness probe hits ``/healthz`` every 10s and each hit is an
+    access-log line that goes down every open stream, so a live stream is never
+    idle long enough for the heartbeat to fire. That makes the ping path the one
+    branch a black-box test can never reach, which is exactly why it needs a
+    test here.
+    """
+    monkeypatch.setattr(logs_router, "_HEARTBEAT_SECONDS", 0.02)
+    logs_router.clear_buffer()
+    logs_router.publish("replayed line", level="info", source="mcp-server")
+
+    response = await logs_router.stream_logs()
+    frames = []
+    try:
+        for _ in range(3):
+            frames.append(await response.body_iterator.__anext__())
+    finally:
+        await response.body_iterator.aclose()
+
+    first = json.loads(frames[0]["data"])
+    assert first["message"] == "replayed line", "the buffer must be replayed first"
+    pings = [f for f in frames[1:] if f.get("event") == "ping"]
+    assert pings, f"an idle stream produced no heartbeat: {frames}"
+    assert pings[0]["data"] == "{}"
+
+
+async def test_stream_fans_out_newly_published_lines(monkeypatch) -> None:
+    """A line published after a client connects reaches that client."""
+    monkeypatch.setattr(logs_router, "_HEARTBEAT_SECONDS", 30)
+    logs_router.clear_buffer()
+    logs_router.publish("replayed line")
+
+    response = await logs_router.stream_logs()
+    try:
+        await response.body_iterator.__anext__()  # drain the replay
+        logs_router.publish("live line", level="error", source="admin")
+        frame = await response.body_iterator.__anext__()
+    finally:
+        await response.body_iterator.aclose()
+
+    payload = json.loads(frame["data"])
+    assert payload["message"] == "live line"
+    assert payload["level"] == "error"
+    assert payload["source"] == "admin"
+
+
+async def test_stream_unsubscribes_when_the_client_goes_away() -> None:
+    """Every closed stream must drop its queue, or publish() leaks forever."""
+    logs_router.clear_buffer()
+    logs_router.publish("replayed line")
+    before = len(logs_router._SUBSCRIBERS)
+
+    response = await logs_router.stream_logs()
+    await response.body_iterator.__anext__()
+    assert len(logs_router._SUBSCRIBERS) == before + 1
+    await response.body_iterator.aclose()
+
+    assert len(logs_router._SUBSCRIBERS) == before
+
+
 def test_install_log_capture_is_idempotent() -> None:
     core_logger = logging.getLogger(logs_router.CORE_PROCESS_LOGGER)
     logs_router.install_log_capture()

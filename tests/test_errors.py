@@ -30,6 +30,92 @@ async def test_401_names_the_master_key() -> None:
         await client.aclose()
 
 
+async def test_upstream_provider_401_does_not_blame_the_master_key() -> None:
+    """A 401 from the model's provider is not a 401 from the proxy.
+
+    LiteLLM returns the same status for both, but the fixes are opposites: one
+    is the operator's LITELLM_MCP_MASTER_KEY, the other is that deployment's
+    api_key. Reporting the provider's rejection as "the master key is wrong"
+    sends an operator to rotate a working key — and rotating the master key is
+    an outage.
+    """
+    body = (
+        "litellm.AuthenticationError: AuthenticationError: "
+        "OpenrouterException - No auth credentials found"
+    )
+    client = _client(lambda r: httpx.Response(401, json={"error": {"message": body}}))
+    try:
+        with pytest.raises(LiteLLMApiError) as exc:
+            await litellm_request(
+                client, "POST", "/chat/completions", json_data={}
+            )
+        message = str(exc.value)
+        assert "LITELLM_MCP_MASTER_KEY" not in message
+        assert "do not" in message.lower() and "rotate" in message.lower()
+        assert "api_key" in message
+        assert "OpenrouterException" in message
+    finally:
+        await client.aclose()
+
+
+async def test_proxy_401_still_names_the_master_key() -> None:
+    """The proxy's own rejection wins even when auth words are in the body."""
+    client = _client(
+        lambda r: httpx.Response(
+            401,
+            json={
+                "error": {
+                    "message": "Authentication Error, Invalid proxy server "
+                    "token passed. AuthenticationError: key not found"
+                }
+            },
+        )
+    )
+    try:
+        with pytest.raises(LiteLLMApiError) as exc:
+            await litellm_request(client, "GET", "/key/list")
+        assert "LITELLM_MCP_MASTER_KEY" in str(exc.value)
+    finally:
+        await client.aclose()
+
+
+async def test_enterprise_gate_is_reported_as_unavailable_not_as_a_fault() -> None:
+    """Community edition answers Enterprise endpoints with a 500 + sales copy.
+
+    Raw, that reads as "the gateway is broken, retry" — so a caller retries a
+    call that can never succeed. It has to say: not your request, not a fault,
+    do not retry.
+    """
+    body = (
+        "Regenerating Virtual Keys is an Enterprise feature, You must be a "
+        "LiteLLM Enterprise user to use this feature. If you have a license "
+        "please set `LITELLM_LICENSE` in your env."
+    )
+    client = _client(lambda r: httpx.Response(500, json={"error": {"message": body}}))
+    try:
+        with pytest.raises(LiteLLMApiError) as exc:
+            await litellm_request(client, "POST", "/key/sk-x/regenerate")
+        message = str(exc.value)
+        assert "Enterprise" in message
+        assert "community edition" in message
+        assert "retrying will not help" in message
+        assert "LITELLM_LICENSE" in message
+    finally:
+        await client.aclose()
+
+
+async def test_a_plain_500_is_not_mistaken_for_the_enterprise_gate() -> None:
+    client = _client(lambda r: httpx.Response(500, json={"error": {"message": "boom"}}))
+    try:
+        with pytest.raises(LiteLLMApiError) as exc:
+            await litellm_request(client, "GET", "/health")
+        message = str(exc.value)
+        assert "Enterprise" not in message
+        assert "boom" in message
+    finally:
+        await client.aclose()
+
+
 async def test_404_names_the_endpoint() -> None:
     client = _client(lambda r: httpx.Response(404, json={"detail": "nope"}))
     try:

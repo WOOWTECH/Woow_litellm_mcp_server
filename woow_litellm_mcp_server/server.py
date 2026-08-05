@@ -4,14 +4,22 @@
 owns the pooled LiteLLM client, then loops over the tool modules calling each
 module's ``register(mcp, gate)`` so only gate-enabled tools are exposed.
 
-Run over Streamable-HTTP (the deployed default) with::
+In the deployed topology this module is *not* launched directly. The admin console
+spawns it as a child process bound to ``127.0.0.1:3000`` and publishes it through the
+token-checking proxy at ``/private_{token}/mcp/``; loopback binding is what makes that
+proxy the only door. Nothing in this module authenticates anything.
+
+For local development, run over Streamable-HTTP with::
 
     python -m woow_litellm_mcp_server.server --transport http \\
-        --host 0.0.0.0 --port 8000 --path /mcp/
+        --host 127.0.0.1 --port 8000 --path /mcp/
 
 or over stdio for local MCP clients::
 
     python -m woow_litellm_mcp_server.server --transport stdio
+
+Binding a non-loopback ``--host`` exposes all tools, including the dangerous ones, to
+anything that can reach that address. Do so only behind an authenticating proxy.
 """
 
 from __future__ import annotations

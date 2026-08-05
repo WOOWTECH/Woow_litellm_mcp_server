@@ -53,9 +53,12 @@ rather than mockups, and their captions quote text visible in the image.
 
 ## FINDING-003 — Documented topology omitted a live, unauthenticated Deployment
 
-**Severity:** high · **Status:** fixed in the docs, open as an operational decision
+**Severity:** high · **Status:** RESOLVED — manifest deleted, cluster cleaned
 
-`docs/deployment.md` listed one workload in namespace `litellm-mcp`. The cluster runs
+*(Written while the defect was live; the state described below has since been cleaned up
+— see "Fix — cluster".)*
+
+`docs/deployment.md` listed one workload in namespace `litellm-mcp`. The cluster ran
 two:
 
 | Deployment | Port | Service | Auth | Public route |
@@ -63,7 +66,7 @@ two:
 | `litellm-mcp-admin` | 8080 | `litellm-mcp-admin:8080` | JWT console + path-token proxy | tunnel → `litellm-mcp.woowtech.io` |
 | `litellm-mcp-server` | 8000 | `litellm-mcp:8000` | **none** | none |
 
-Both are `Ready 1/1`. The admin console spawns its *own* FastMCP child on
+Both were `Ready 1/1`. The admin console spawns its *own* FastMCP child on
 `127.0.0.1:3000` and never dials `litellm-mcp:8000`, so the second Deployment serves no
 part of the public path — verified from `cloudflared`, whose logs name the origin
 explicitly as `http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080`
@@ -76,21 +79,39 @@ all 40 tools, including the 8 dangerous ones, to anything with cluster network r
 no token, no JWT, no gate beyond the `LITELLM_MCP_*` environment variables on that
 Deployment (all unset).
 
-**Fix.** `docs/deployment.md` now documents three workloads, names the two modes, states
-which one is live and gives the `cloudflared` command that proves it.
-`docs/architecture.md` §9 explains why both modes exist and why running both is a
-decision rather than redundancy.
+**Root cause.** Not an oversight in the prose — a defect in the file layout. The header
+of `k8s-deploy.yaml` announced "This file documents TWO deployment paths. Pick ONE
+Deployment", but its standalone path was the one left uncommented, *and* the same file
+carried the shared `Namespace` and `Secret/litellm-mcp-secret` that the console needs.
+`k8s-admin-deploy.yaml`'s own header then instructed the reader to
+`kubectl apply -f k8s-deploy.yaml   # namespace + litellm-mcp-secret` first. Following
+the documented order therefore *always* produced the unauthenticated `:8000` endpoint.
+Nobody chose it; the layout chose it for them.
 
-**Open decision.** Either keep `litellm-mcp-server` deliberately, as an in-cluster
-unauthenticated endpoint, or delete `Deployment/litellm-mcp-server` and
-`Service/litellm-mcp`. Deleting them removes a live capability surface at zero cost to
-the public endpoint. Recorded as OPEN-5.
+**Fix — repository.** `k8s-deploy.yaml` is deleted. The namespace and gateway secret now
+live alone in a new `k8s-base.yaml`, which contains **no workload at all**; that
+separation is the point of the file and its header says so. `k8s-admin-deploy.yaml` is
+now labelled "THIS IS THE ONLY DEPLOYMENT PATH" and carries an explicit "do not
+reintroduce it" note. `k8s-secret.example.yaml` was folded into `k8s-base.yaml` and
+deleted, since it duplicated the same Namespace + Secret pair and was a third source of
+truth for the same two objects. `docs/deployment.md`, `docs/architecture.md` §9,
+`README.md` and `README_zh-TW.md` were rewritten to describe one path, and each carries
+an upgrade note with the cleanup commands.
+
+**Fix — cluster.** `Deployment/litellm-mcp-server` and `Service/litellm-mcp` were deleted
+from namespace `litellm-mcp` on 5 August 2026, with the user's explicit approval.
+`Namespace/litellm-mcp` and `Secret/litellm-mcp-secret` were kept — the console's
+`seed-config` init container reads the latter. Post-delete state: one Deployment
+(`litellm-mcp-admin`, `1/1`), one Service (`litellm-mcp-admin:8080`), one pod
+(`litellm-mcp-admin-749b47fb6c-zm9zg`, `Running`, **0 restarts** — i.e. the console was
+not disturbed), both Secrets present. OPEN-5 is closed by this.
 
 ---
 
 ## FINDING-004 — `seed-config` reverts console-side password and token changes
 
-**Severity:** high · **Status:** documented; code change recommended
+**Severity:** high · **Status:** FIXED in the manifest; live Deployment still carries the
+old script until re-applied
 
 The `seed-config` init container was documented — and described in BUG-2 below — as
 idempotent, seeding `/data/config.json` only when absent. The live script does not do
@@ -111,14 +132,37 @@ silently reverted to the Secret's value. A rollout, node drain or eviction is en
 For the token this is the worse case: clients repointed to the new URL start getting
 404s, and the failure looks like a client problem rather than a config revert.
 
-**Fix.** `docs/deployment.md` now states exactly which keys are overwritten and which
-survive, and both the first-deploy and rotation procedures instruct the operator to
-update `Secret/litellm-mcp-admin-secret` alongside any console-side change.
+**Evidence it was a regression, not a design choice.** The commented-out PATH A template
+at the tail of the old `k8s-deploy.yaml` used `if not p.exists():` around its own
+seed-config — the same repository, the same init container, the opposite behaviour. The
+unconditional assignment in the live manifest was drift, not intent. That removed the
+remaining ambiguity from OPEN-6.
 
-**Recommended code change.** Treat the Secret as a *seed* for these two keys —
-`cfg.setdefault("admin_password", ...)` — so the stored value wins once set, and keep
-the unconditional write only for `connection`, which is genuinely manifest-owned.
-Recorded as OPEN-6.
+**Fix.** `k8s-admin-deploy.yaml` now uses:
+
+```python
+cfg.setdefault("admin_password", os.environ["ADMIN_PASSWORD"])
+cfg.setdefault("mcp_auth_token", os.environ["MCP_AUTH_TOKEN"])
+cfg["connection"] = {...from the Secret...}    # still unconditional, on purpose
+```
+
+The split is principled rather than cosmetic: `admin_password` and `mcp_auth_token` are
+the console's *own* credentials and the console mutates them at runtime, so the Secret
+seeds first boot and `/data` is the truth afterwards. `connection` is infrastructure, not
+user state, so rotating the LiteLLM master key in the Secret must still reach the console
+on the next restart. The comment block in the manifest states this so the next person
+does not "simplify" the two forms back into one. `docs/deployment.md` documents the
+three-way split and both procedures were rewritten accordingly. OPEN-6 is closed.
+
+**Residual risk — read this before assuming it is done.** Editing the manifest does not
+change the running object. `Deployment/litellm-mcp-admin` in the cluster still embeds the
+old unconditional script and will keep reverting console-side changes until someone
+`kubectl apply -f k8s-admin-deploy.yaml`. That apply is **not** free: `strategy: Recreate`
+means the old pod terminates before the new one starts, and cold start is 2.5–3 minutes,
+so the console and the public MCP endpoint are down for that window. It was deliberately
+not performed as part of this pass. Until it is, keep updating
+`Secret/litellm-mcp-admin-secret` by hand alongside any console-side password or token
+change.
 
 **Note on BUG-2.** The historical entry below claims the fix was "seeds only when the
 file is absent". That is not what shipped. The shipped fix was narrower: preserve
@@ -282,16 +326,22 @@ LiteLLM master key (`sk-bcae…`) is a reasonable rotation candidate on general 
 grounds — but note that `LITELLM_SALT_KEY` must **not** be rotated with it, as that
 would make every encrypted database column undecryptable.
 
-**OPEN-5 — Decide the fate of `Deployment/litellm-mcp-server`.** It is live, healthy,
-unauthenticated, reachable from anywhere in the cluster, and carries no public traffic
-(FINDING-003). Either document it as an intentional in-cluster endpoint and gate it with
-`LITELLM_MCP_READONLY` or `LITELLM_MCP_DISABLED_TOOLS`, or delete the Deployment and its
-Service. Leaving it undecided is the only bad option.
+**OPEN-5 — ~~Decide the fate of `Deployment/litellm-mcp-server`.~~ CLOSED.** Decided:
+deleted. `k8s-deploy.yaml` was removed from the repository and the live Deployment and
+`Service/litellm-mcp` were deleted from the cluster. See FINDING-003.
 
-**OPEN-6 — Make `seed-config` seed rather than overwrite.** Change
-`cfg["admin_password"] = …` and `cfg["mcp_auth_token"] = …` to `setdefault`, so a value
-set from the console wins over the Secret once it exists (FINDING-004). Until then the
-Secret and the console must be updated together by hand.
+**OPEN-6 — ~~Make `seed-config` seed rather than overwrite.~~ CLOSED in the manifest.**
+`admin_password` and `mcp_auth_token` now use `setdefault`; `connection` stays an
+assignment on purpose. See FINDING-004. **The follow-up is not closed:** the running
+Deployment object still embeds the old script and reverts console-side changes until
+`k8s-admin-deploy.yaml` is re-applied, which under `strategy: Recreate` means a 2.5–3
+minute console outage. Schedule it; do not apply it blind.
+
+**OPEN-7 — Re-apply `k8s-admin-deploy.yaml` to land the FINDING-004 fix.** The one
+outstanding action from this pass. It also picks up the rewritten header comments. Plan
+for downtime, and update `Secret/litellm-mcp-admin-secret` to the *current* console
+password and token before applying, since the pre-fix pod may have reverted them
+already — check `/data/config.json` against the Secret first.
 
 ---
 
@@ -308,7 +358,9 @@ Statements a reviewer can check independently.
 | Five deployments, all healthy | `litellm_health` against the gateway |
 | No secrets in the tree | `git grep -nE 'sk-[a-zA-Z0-9]{20,}\|ghp_[a-zA-Z0-9]{30,}'` returns nothing |
 | No configuration was changed | Compare `/data/config.json` against its pre-pass state; the pass performed reads only |
-| Two Deployments in `litellm-mcp`, not one | `kubectl get deploy,svc -n litellm-mcp` |
-| The console proxies to a loopback child, not to `litellm-mcp:8000` | `kubectl exec -n litellm-mcp deploy/litellm-mcp-admin -c admin -- python -c "import json;print(json.load(open('/data/config.json'))['mcp_server'])"` |
-| The tunnel's origin is the admin Service | `kubectl logs -n litellm deploy/cloudflared --tail=200 \| grep originService` |
-| `litellm-mcp:8000` answers with no credential | `kubectl exec -n litellm-mcp deploy/litellm-mcp-admin -c admin -- python -c "import httpx;print(httpx.get('http://litellm-mcp.litellm-mcp.svc.cluster.local:8000/mcp/').status_code)"` — returns `406`, i.e. the server is live and only objecting to the `Accept` header |
+| Exactly one Deployment and one Service in `litellm-mcp` | `kubectl get deploy,svc -n litellm-mcp` — expect `litellm-mcp-admin` only. Anything named `litellm-mcp-server` or `Service/litellm-mcp` is a pre-cleanup leftover (FINDING-003) |
+| The namespace and gateway Secret survived the cleanup | `kubectl get ns litellm-mcp` and `kubectl get secret -n litellm-mcp` — expect `litellm-mcp-secret` and `litellm-mcp-admin-secret` |
+| The console proxies to a loopback child | `kubectl exec -n litellm-mcp deploy/litellm-mcp-admin -c admin -- python -c "import json;print(json.load(open('/data/config.json'))['mcp_server'])"` — `--host 127.0.0.1 --port 3000` |
+| The tunnel's origin is the admin Service | `kubectl logs -n litellm deploy/cloudflared --tail=200 \| grep originService` — grep `originService`, **not** `dest=`; the latter prints the live token (FINDING-006) |
+| The repository ships exactly two manifests | `ls k8s-*.yaml` → `k8s-base.yaml`, `k8s-admin-deploy.yaml` |
+| `k8s-base.yaml` contains no workload | `python -c "import yaml,sys;print([(d['kind'],d['metadata']['name']) for d in yaml.safe_load_all(open('k8s-base.yaml')) if d])"` → `Namespace`, `Secret` only |

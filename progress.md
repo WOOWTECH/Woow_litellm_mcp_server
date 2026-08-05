@@ -176,13 +176,75 @@ OPEN-6 as the two decisions left to the operator. Corrections pushed to
 `findings.md` and this file.
 
 The repository manifests themselves were checked against the live specs and match
-exactly — `k8s-deploy.yaml` and `k8s-admin-deploy.yaml` are accurate. The defect was in
-the prose, not the YAML.
+exactly. The prose was wrong about which workloads existed — but Phase 6 found that the
+*layout* of the YAML was what produced the second workload in the first place.
+
+---
+
+## Phase 6 — Consolidation onto the admin path · complete
+
+Requested directly: keep the console deployment and everything it provides (React SPA,
+JWT login, the encrypted proxy at `/private_{token}/mcp/`, the PVC, Permissions-page
+gating with a child restart instead of a pod rollout, the SSE log stream) and remove the
+older standalone MCP-server deployment completely — from the repository and from the
+cluster.
+
+**Root cause found first.** Phase 5 called FINDING-003 a prose defect. It was not. The
+header of `k8s-deploy.yaml` claimed to document two mutually exclusive paths, but the
+standalone Deployment inside it was the uncommented one, and the same file also carried
+the `Namespace` and `Secret/litellm-mcp-secret` that the console depends on —
+`k8s-admin-deploy.yaml` told the reader to apply it first for exactly that reason. The
+documented install order could not produce a console-only cluster. Separately, the
+commented-out template at the tail of that same file used `if not p.exists():` in its
+seed-config, which proved FINDING-004's unconditional overwrite was drift rather than
+design and closed the open question in OPEN-6.
+
+### Repository
+
+| Change | Detail |
+|---|---|
+| `k8s-base.yaml` | **New.** `Namespace/litellm-mcp` + `Secret/litellm-mcp-secret`, and **no workload** — that separation is the fix. Header warns that applying it over a live cluster overwrites the real master key with the placeholder, and gives the `kubectl create secret` form for a first install |
+| `k8s-admin-deploy.yaml` | Header rewritten to "THIS IS THE ONLY DEPLOYMENT PATH", explains the FastMCP server is a child process rather than a workload, records that the second manifest was removed and says not to reintroduce it. Apply order is now `k8s-base.yaml` → this file |
+| `k8s-admin-deploy.yaml` seed-config | `admin_password` and `mcp_auth_token` switched to `setdefault`; `connection` deliberately left as an assignment, with a comment explaining why the two forms differ. Closes OPEN-6 |
+| `k8s-deploy.yaml` | **Deleted** |
+| `k8s-secret.example.yaml` | **Deleted** — it duplicated the Namespace + Secret pair now in `k8s-base.yaml` and was a third source of truth for the same two objects. This went one step beyond the explicit request and is called out here for that reason |
+| `docs/deployment.md` | Topology table down to two workloads; "the server is a child process, not a workload"; new "Removed: the standalone Deployment" section with cleanup commands; first-deploy and health-check blocks rewritten; the `seed-config` behaviour table now has a three-way split plus an upgrade warning; rotation step 3 relaxed with a note for pre-fix clusters |
+| `docs/architecture.md` | §9 retitled "One deployment path, and why the second one was removed" and rewritten around the layout defect |
+| `README.md` / `README_zh-TW.md` | Installation reduced from four options to three; the bare server is now labelled development-only and bound to `127.0.0.1`; package tables updated; upgrade-cleanup callout added to both |
+| `CONTRIBUTING.md` | "Running the server" retitled development-only, `--host` changed to `127.0.0.1`, with a note that the deployed topology never runs it this way |
+| `cloudflare/README.md` | Stale "36 LiteLLM tools" corrected to 40 |
+
+### Cluster
+
+Deleted with explicit approval, in namespace `litellm-mcp`:
+
+- `Deployment/litellm-mcp-server`
+- `Service/litellm-mcp`
+
+Kept, because `seed-config` reads it: `Namespace/litellm-mcp` and
+`Secret/litellm-mcp-secret`. The `litellm` namespace, the `litellm` Service and the
+Cloudflare tunnel were not touched.
+
+Post-delete verification: one Deployment (`litellm-mcp-admin`, `1/1`), one Service
+(`litellm-mcp-admin:8080`), one pod (`litellm-mcp-admin-749b47fb6c-zm9zg`, `Running`,
+**0 restarts** — the console was not disturbed by the deletion), both Secrets present.
+
+### What is deliberately *not* done
+
+The FINDING-004 `setdefault` fix lives in the manifest, not in the running Deployment
+object. Landing it needs `kubectl apply -f k8s-admin-deploy.yaml`, and under
+`strategy: Recreate` with a 2.5–3 minute cold start that means the console and the public
+MCP endpoint go down for the duration. Not performed unprompted. Recorded as OPEN-7.
 
 ---
 
 ## Settings touched
 
-None. No configuration value on either deployment was changed at any point in this
-pass; every interaction with the console was a read or a navigation. Constraint #5
-therefore has nothing to restore.
+No configuration value on the admin console was changed at any point across Phases 1–6;
+every interaction with the console was a read or a navigation, so Constraint #5 has
+nothing to restore there.
+
+Two cluster objects were **deleted** in Phase 6 — `Deployment/litellm-mcp-server` and
+`Service/litellm-mcp` — at the user's explicit instruction. These are intentionally not
+restored; removing them was the point of the request. Everything needed to recreate them
+is in the git history of the deleted `k8s-deploy.yaml`.

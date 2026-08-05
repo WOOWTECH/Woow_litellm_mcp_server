@@ -114,9 +114,14 @@ with mcpc.Session() as s:
 
         if state.get('model_id'):
             # A rename with NO litellm_params is the exact shape that used to
-            # fail: LiteLLM's update handler rejects a body without that field,
-            # so the tool now always sends {} (= "change nothing about routing
-            # or credentials") and the rename goes through.
+            # fail, and it failed twice over. LiteLLM's legacy
+            # POST /model/update rejects a body without that field outright;
+            # and even once you satisfy it, that handler persists only
+            # litellm_params, so it answered 200 while the name never changed.
+            # The tool now PATCHes /model/{id}/update, which applies
+            # model_name and does not demand a litellm_params body at all.
+            # Hence the two follow-up assertions: the rename must be visible
+            # in a fresh read, and routing must survive it.
             run(s, 'litellm_update_model',
                 {'model_id': state['model_id'], 'model_name': TAG + '-renamed'},
                 'models: litellm_update_model renames it with no litellm_params')

@@ -23,7 +23,7 @@ from .lifespan import LITELLM_CLIENT_KEY
 class LiteLLMHttp:
     """A thin, non-closeable wrapper around the pooled httpx client.
 
-    Provides ``get``/``post``/``put``/``delete``/``request`` convenience methods
+    Provides ``get``/``post``/``put``/``patch``/``delete``/``request`` methods
     that return decoded JSON and route through :func:`litellm_request` so all
     error mapping is centralised.
     """
@@ -78,6 +78,11 @@ class LiteLLMHttp:
         self, path: str, *, json_data: Any | None = None, **kwargs: Any
     ) -> Any:
         return await self.request("PUT", path, json_data=json_data, **kwargs)
+
+    async def patch(
+        self, path: str, *, json_data: Any | None = None, **kwargs: Any
+    ) -> Any:
+        return await self.request("PATCH", path, json_data=json_data, **kwargs)
 
     async def delete(self, path: str, **kwargs: Any) -> Any:
         return await self.request("DELETE", path, **kwargs)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 from fastmcp import Context
 
@@ -142,47 +143,42 @@ def register(mcp: Any, gate: ToolGate) -> None:
             model_info: dict[str, Any] | None = None,
             model_name: str | None = None,
         ) -> dict:
-            """Update an existing deployment (updateDeployment body).
+            """Update an existing deployment in place.
 
             ``model_id`` is the deployment id from ``litellm_add_model`` /
-            ``litellm_model_info``. Note that LiteLLM persists only ``id`` out
-            of ``model_info`` on this endpoint — other metadata keys you pass
-            there are accepted but not stored, so re-read with
-            ``litellm_model_info`` if you need to confirm a metadata change.
+            ``litellm_model_info``. Every field is optional and independent:
+            pass ``model_name`` to rename the deployment, ``model_info`` to
+            change stored metadata, ``litellm_params`` to change routing or
+            credentials. Whatever you omit is left exactly as it was — the
+            fields you do pass are merged into the stored deployment rather
+            than replacing it wholesale.
 
-            Omitting ``litellm_params`` leaves the deployment's routing and
-            credentials untouched; the same ``os.environ/`` restriction as
-            ``litellm_add_model`` applies to any value you do pass.
+            The same ``os.environ/`` restriction as ``litellm_add_model``
+            applies to any ``litellm_params`` value you pass.
             """
             gate.require_operation("litellm_update_model", OP_UPDATE)
             if litellm_params:
                 _reject_env_refs(litellm_params)
-            # LiteLLM's /model/update resolves the deployment EXCLUSIVELY from
-            # model_info.id and discards a top-level "model_id"; sending only
-            # model_id fails with "model_info not provided". Fold it in (last,
-            # so the id always wins) while keeping model_id as the public
-            # argument so the tool schema stays obvious to a calling agent.
+            # Deliberately PATCH /model/{id}/update, NOT POST /model/update.
+            # The latter is LiteLLM's legacy endpoint (its own docstring says
+            # "Old endpoint for model update ... Use /model/{model_id}/update
+            # to PATCH the stored model in db"): its handler writes only
+            # litellm_params and updated_by to the database, so a rename or a
+            # metadata change through it returns 200 and then silently does
+            # nothing. The PATCH handler routes through update_db_model(),
+            # which applies model_name, merges+re-encrypts litellm_params and
+            # updates model_info, and does not demand a litellm_params body.
             merged_info = dict(model_info or {})
             merged_info["id"] = model_id
             body = prune_none(
                 {
                     "model_name": model_name,
                     "model_info": merged_info,
+                    "litellm_params": litellm_params,
                 }
             )
-            # litellm_params is deliberately NOT run through prune_none and is
-            # never dropped. LiteLLM's update handler raises a bare
-            # "litellm_params not provided" (surfaced as a 400 that reads like a
-            # caller mistake) the moment the field is absent, so a
-            # rename-only or metadata-only update used to be impossible. It then
-            # merges the object field by field against the stored deployment, so
-            # {} means "change nothing here" and leaves the existing
-            # model/api_base/api_key exactly as they were.
-            body["litellm_params"] = (
-                litellm_params if litellm_params is not None else {}
-            )
-            return await litellm_client(ctx).post(
-                "/model/update", json_data=body
+            return await litellm_client(ctx).patch(
+                f"/model/{quote(model_id, safe='')}/update", json_data=body
             )
 
     if gate.is_tool_enabled("litellm_delete_model"):

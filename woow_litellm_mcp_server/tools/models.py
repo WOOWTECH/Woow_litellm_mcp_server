@@ -8,6 +8,7 @@ from fastmcp import Context
 
 from ..deps import litellm_client
 from ..gating import ToolGate
+from ..registry import OP_CREATE, OP_DELETE, OP_UPDATE
 from ._common import destructive, prune_none, read_only, writing
 
 
@@ -74,6 +75,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
             ``litellm_params`` holds at least ``{"model": ..., "api_base": ...,
             "api_key": ...}``; ``model_info`` carries optional metadata.
             """
+            gate.require_operation("litellm_add_model", OP_CREATE)
             body = prune_none(
                 {
                     "model_name": model_name,
@@ -94,13 +96,29 @@ def register(mcp: Any, gate: ToolGate) -> None:
             model_id: str,
             litellm_params: dict[str, Any] | None = None,
             model_info: dict[str, Any] | None = None,
+            model_name: str | None = None,
         ) -> dict:
-            """Update an existing deployment (updateDeployment body)."""
+            """Update an existing deployment (updateDeployment body).
+
+            ``model_id`` is the deployment id from ``litellm_add_model`` /
+            ``litellm_model_info``. Note that LiteLLM persists only ``id`` out
+            of ``model_info`` on this endpoint — other metadata keys you pass
+            there are accepted but not stored, so re-read with
+            ``litellm_model_info`` if you need to confirm a metadata change.
+            """
+            gate.require_operation("litellm_update_model", OP_UPDATE)
+            # LiteLLM's /model/update resolves the deployment EXCLUSIVELY from
+            # model_info.id and discards a top-level "model_id"; sending only
+            # model_id fails with "model_info not provided". Fold it in (last,
+            # so the id always wins) while keeping model_id as the public
+            # argument so the tool schema stays obvious to a calling agent.
+            merged_info = dict(model_info or {})
+            merged_info["id"] = model_id
             body = prune_none(
                 {
-                    "model_id": model_id,
+                    "model_name": model_name,
                     "litellm_params": litellm_params,
-                    "model_info": model_info,
+                    "model_info": merged_info,
                 }
             )
             return await litellm_client(ctx).post(
@@ -119,6 +137,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
             This unregisters the deployment from the gateway; it cannot be
             undone without re-adding the model.
             """
+            gate.require_operation("litellm_delete_model", OP_DELETE)
             return await litellm_client(ctx).post(
                 "/model/delete", json_data={"id": model_id}
             )

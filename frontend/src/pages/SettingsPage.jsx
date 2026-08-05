@@ -1,10 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Save,
   Loader2,
   CheckCircle2,
   XCircle,
+  AlertTriangle,
   RotateCw,
   Plus,
   Trash2,
@@ -14,7 +16,7 @@ import {
   Shield,
   Network,
 } from 'lucide-react';
-import { apiGet, apiPut, apiPost } from '../api';
+import { apiGet, apiPut, apiPost, clearToken } from '../api';
 
 function SectionCard({ title, icon: Icon, children }) {
   return (
@@ -28,17 +30,26 @@ function SectionCard({ title, icon: Icon, children }) {
   );
 }
 
-function StatusBadge({ running }) {
+function StatusBadge({ status }) {
+  // `running` is process liveness; `ready` is "accepting connections on the
+  // port". They differ for the 10-14s the FastMCP child needs to bind after a
+  // restart, and during that window the connector answers 502 — so a single
+  // green "Running" pill was actively misleading right after every save.
+  const running = !!status?.running;
+  const ready = !!status?.ready;
+  const label = !running ? 'Stopped' : ready ? 'Running' : 'Starting…';
+  const tone = !running
+    ? 'bg-gray-700/50 text-gray-400 border-gray-600'
+    : ready
+      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+      : 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+  const dot = !running ? 'bg-gray-500' : ready ? 'bg-emerald-400' : 'bg-amber-400';
   return (
     <span
-      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
-        running
-          ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
-          : 'bg-gray-700/50 text-gray-400 border border-gray-600'
-      }`}
+      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${tone}`}
     >
-      <span className={`w-1.5 h-1.5 rounded-full ${running ? 'bg-emerald-400' : 'bg-gray-500'}`} />
-      {running ? 'Running' : 'Stopped'}
+      <span className={`w-1.5 h-1.5 rounded-full ${dot}`} />
+      {label}
     </span>
   );
 }
@@ -46,12 +57,44 @@ function StatusBadge({ running }) {
 function Alert({ type, message }) {
   const styles = {
     success: 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400',
+    warning: 'bg-amber-500/10 border-amber-500/20 text-amber-300',
     error: 'bg-red-500/10 border-red-500/20 text-red-400',
   };
+  const Icon = type === 'success' ? CheckCircle2 : type === 'warning' ? AlertTriangle : XCircle;
   return (
-    <div className={`flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm border ${styles[type]}`}>
-      {type === 'success' ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+    <div
+      className={`flex items-start gap-2 px-3 py-2.5 rounded-lg text-sm border ${styles[type] || styles.error}`}
+    >
+      <Icon size={16} className="shrink-0 mt-0.5" />
       <span>{message}</span>
+    </div>
+  );
+}
+
+/** Inline "are you sure" strip — the destructive buttons all restart the child. */
+function ConfirmBar({ message, onConfirm, onCancel, pending }) {
+  return (
+    <div className="flex items-start gap-2 px-3 py-2.5 rounded-lg text-sm border bg-amber-500/10 border-amber-500/20 text-amber-300">
+      <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+      <div className="flex-1">
+        <p>{message}</p>
+        <div className="flex gap-2 mt-2">
+          <button
+            onClick={onConfirm}
+            disabled={pending}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:bg-gray-700 disabled:text-gray-500 text-white text-xs font-medium rounded-lg transition-colors"
+          >
+            {pending && <Loader2 size={12} className="animate-spin" />}
+            <span>Yes, restart it</span>
+          </button>
+          <button
+            onClick={onCancel}
+            className="px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs font-medium rounded-lg transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -59,16 +102,33 @@ function Alert({ type, message }) {
 const inputClass =
   'w-full px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-gray-100 placeholder-gray-600 focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500 transition-colors font-mono text-sm';
 
+// The backend rejects anything shorter; keep the two ends in step so the
+// operator is told before the round trip, not by a 400.
+const MIN_PASSWORD_LEN = 8;
+
+/** The --port value sitting in argv, if any. */
+function argPort(args) {
+  const list = Array.isArray(args) ? args.map(String) : [];
+  for (let i = 0; i < list.length; i += 1) {
+    if (list[i] === '--port' && i + 1 < list.length) return list[i + 1];
+    if (list[i].startsWith('--port=')) return list[i].slice('--port='.length);
+  }
+  return null;
+}
+
 export default function SettingsPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const [mcpForm, setMcpForm] = useState({ command: '', args: [], port: 3000, env: {} });
   const [proxyForm, setProxyForm] = useState({ timeout: 86400, bearer_token: '' });
+  const [bearerTouched, setBearerTouched] = useState(false);
   const [passwordForm, setPasswordForm] = useState({ current: '', new_password: '' });
   const [newEnvKey, setNewEnvKey] = useState('');
   const [newEnvVal, setNewEnvVal] = useState('');
   const [newArg, setNewArg] = useState('');
   const [showBearerToken, setShowBearerToken] = useState(false);
   const [feedback, setFeedback] = useState(null);
+  const [confirming, setConfirming] = useState(null); // 'save' | 'restart' | null
 
   const { data: settings, isLoading } = useQuery({
     queryKey: ['settings'],
@@ -93,8 +153,11 @@ export default function SettingsPage() {
       const proxy = settings.proxy || {};
       setProxyForm({
         timeout: proxy.timeout || 86400,
+        // Arrives MASKED. It is only ever sent back when the operator retypes
+        // it (see bearerTouched) so the mask cannot overwrite the real token.
         bearer_token: proxy.bearer_token || '',
       });
+      setBearerTouched(false);
     }
   }, [settings]);
 
@@ -103,34 +166,63 @@ export default function SettingsPage() {
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
       queryClient.invalidateQueries({ queryKey: ['mcpStatus'] });
-      setFeedback({ type: 'success', message: res.message || 'MCP server config saved' });
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      setConfirming(null);
+      // "partial" means saved but the child is not accepting connections yet —
+      // the connector is answering 502 right now, so do not call that success.
+      setFeedback({
+        type: res.status === 'ok' ? 'success' : 'warning',
+        message: res.message || 'MCP server config saved',
+      });
     },
-    onError: (err) => setFeedback({ type: 'error', message: err.message }),
+    onError: (err) => {
+      setConfirming(null);
+      setFeedback({ type: 'error', message: err.message });
+    },
   });
 
   const saveProxyMutation = useMutation({
     mutationFn: (data) => apiPut('/settings/proxy', data),
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
-      setFeedback({ type: 'success', message: res.message || 'Proxy config saved' });
+      setFeedback({
+        type: res.status === 'ok' || !res.status ? 'success' : 'warning',
+        message: res.message || 'Proxy config saved',
+      });
     },
     onError: (err) => setFeedback({ type: 'error', message: err.message }),
   });
 
   const restartMutation = useMutation({
     mutationFn: () => apiPost('/settings/mcp/restart'),
-    onSuccess: () => {
+    onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['mcpStatus'] });
-      setFeedback({ type: 'success', message: 'MCP server restarted' });
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      setConfirming(null);
+      setFeedback({
+        type: res.status === 'ok' ? 'success' : res.status === 'error' ? 'error' : 'warning',
+        message: res.message || 'MCP server restarted',
+      });
     },
-    onError: (err) => setFeedback({ type: 'error', message: err.message }),
+    onError: (err) => {
+      setConfirming(null);
+      setFeedback({ type: 'error', message: err.message });
+    },
   });
 
   const passwordMutation = useMutation({
     mutationFn: (data) => apiPut('/settings/admin_password', data),
     onSuccess: () => {
       setPasswordForm({ current: '', new_password: '' });
-      setFeedback({ type: 'success', message: 'Admin password updated' });
+      setFeedback({
+        type: 'success',
+        message: 'Admin password updated. All sessions were revoked — signing you out…',
+      });
+      // The backend revokes every issued JWT (and the httpOnly cookie), so the
+      // token still in localStorage is dead. Staying on the page would 401 on
+      // the next poll; go to /login deliberately instead.
+      clearToken();
+      setTimeout(() => navigate('/login'), 1200);
     },
     onError: (err) => setFeedback({ type: 'error', message: err.message }),
   });
@@ -168,6 +260,17 @@ export default function SettingsPage() {
     }));
   }
 
+  // config.json carries the port twice: as `mcp_server.port` (which the proxy
+  // dials, and which the launcher now injects into argv) and as a literal
+  // --port in `args`. Surface the disagreement rather than letting the
+  // operator believe the argv value is what the child will bind.
+  const argvPort = useMemo(() => argPort(mcpForm.args), [mcpForm.args]);
+  const portMismatch = argvPort != null && String(mcpForm.port) !== argvPort;
+
+  const proxyPayload = bearerTouched
+    ? { timeout: proxyForm.timeout, bearer_token: proxyForm.bearer_token }
+    : { timeout: proxyForm.timeout };
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -194,12 +297,12 @@ export default function SettingsPage() {
       <div className="space-y-6 max-w-2xl">
         <SectionCard title="MCP Server Process" icon={Server}>
           <div className="flex items-center justify-between mb-4">
-            <StatusBadge running={mcpStatus?.running} />
+            <StatusBadge status={mcpStatus} />
             <div className="flex gap-2">
               <button
-                onClick={() => restartMutation.mutate()}
-                disabled={restartMutation.isPending}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm rounded-lg transition-colors"
+                onClick={() => setConfirming('restart')}
+                disabled={restartMutation.isPending || confirming === 'restart'}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:text-gray-600 text-gray-300 text-sm rounded-lg transition-colors"
               >
                 {restartMutation.isPending ? (
                   <Loader2 size={14} className="animate-spin" />
@@ -211,9 +314,21 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          {confirming === 'restart' && (
+            <div className="mb-4">
+              <ConfirmBar
+                message="Restarting the MCP server drops every in-flight connector session (including claude.ai) and the child needs ~10-15s to accept connections again."
+                pending={restartMutation.isPending}
+                onConfirm={() => restartMutation.mutate()}
+                onCancel={() => setConfirming(null)}
+              />
+            </div>
+          )}
+
           {mcpStatus?.running && (
             <div className="text-xs text-gray-500 mb-4 font-mono">
               PID: {mcpStatus.pid} | Restarts: {mcpStatus.restart_count}
+              {mcpStatus.state ? ` | ${mcpStatus.state}` : ''}
             </div>
           )}
 
@@ -242,8 +357,16 @@ export default function SettingsPage() {
                 className={inputClass + ' max-w-[120px]'}
               />
               <p className="text-xs text-gray-600 mt-1">
-                Loopback port the child binds (127.0.0.1). The proxy forwards here.
+                Loopback port (127.0.0.1) the child binds and the proxy forwards to. This value
+                is authoritative: it overrides any <code className="text-gray-500">--port</code>{' '}
+                in Arguments when the process is launched.
               </p>
+              {portMismatch && (
+                <p className="text-xs text-amber-400 mt-1">
+                  Arguments still say <code>--port {argvPort}</code>. Saving launches the child on{' '}
+                  {mcpForm.port} regardless — remove the stale argument to avoid confusion.
+                </p>
+              )}
             </div>
 
             <div>
@@ -336,16 +459,35 @@ export default function SettingsPage() {
                   </button>
                 </div>
               </div>
+              {/* Secret-looking variables (…KEY/…TOKEN/…PASSWORD/…SECRET) are
+                  returned masked. Leaving one untouched saves it unchanged;
+                  editing it replaces the real value. */}
+              <p className="text-xs text-gray-600 mt-1.5">
+                Values of key/token/password/secret variables are shown masked. Leave one as-is to
+                keep the stored value; type over it to replace it.
+              </p>
             </div>
 
+            {confirming === 'save' && (
+              <ConfirmBar
+                message="Saving restarts the MCP server: in-flight connector sessions are dropped and the child needs ~10-15s to accept connections again."
+                pending={saveMcpMutation.isPending}
+                onConfirm={() => saveMcpMutation.mutate(mcpForm)}
+                onCancel={() => setConfirming(null)}
+              />
+            )}
+
             <button
-              onClick={() => saveMcpMutation.mutate(mcpForm)}
-              disabled={saveMcpMutation.isPending}
+              onClick={() => setConfirming('save')}
+              disabled={saveMcpMutation.isPending || confirming === 'save'}
               className="flex items-center gap-2 px-4 py-2.5 bg-brand-600 hover:bg-brand-500 disabled:bg-gray-700 text-white font-medium rounded-lg transition-colors"
             >
               {saveMcpMutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
               Save MCP Config
             </button>
+            <p className="text-xs text-gray-600">
+              Saving this section restarts the MCP server process.
+            </p>
           </div>
         </SectionCard>
 
@@ -376,7 +518,10 @@ export default function SettingsPage() {
                 <input
                   type={showBearerToken ? 'text' : 'password'}
                   value={proxyForm.bearer_token}
-                  onChange={(e) => setProxyForm((p) => ({ ...p, bearer_token: e.target.value }))}
+                  onChange={(e) => {
+                    setBearerTouched(true);
+                    setProxyForm((p) => ({ ...p, bearer_token: e.target.value }));
+                  }}
                   placeholder="Leave empty unless the child enforces StaticTokenVerifier"
                   className={inputClass + ' pr-10'}
                 />
@@ -390,12 +535,13 @@ export default function SettingsPage() {
               </div>
               <p className="text-xs text-gray-600 mt-1">
                 Injected as <code className="text-gray-500">Authorization: Bearer</code> when the proxy
-                forwards to the loopback MCP child.
+                forwards to the loopback MCP child. Shown masked; it is only written back when you
+                edit it.
               </p>
             </div>
 
             <button
-              onClick={() => saveProxyMutation.mutate(proxyForm)}
+              onClick={() => saveProxyMutation.mutate(proxyPayload)}
               disabled={saveProxyMutation.isPending}
               className="flex items-center gap-2 px-4 py-2.5 bg-brand-600 hover:bg-brand-500 disabled:bg-gray-700 text-white font-medium rounded-lg transition-colors"
             >
@@ -408,8 +554,31 @@ export default function SettingsPage() {
         <SectionCard title="Admin Password" icon={Shield}>
           <div className="space-y-4">
             <p className="text-sm text-gray-500">
-              Current: <code className="text-gray-400">{settings?.admin_password_masked}</code>
+              Current:{' '}
+              <code className="text-gray-400">
+                {settings?.admin_password_configured
+                  ? settings?.admin_password_masked
+                  : '(not set)'}
+              </code>
             </p>
+            {/* The backend requires proof of the current password: without it,
+                anything holding the 12h admin JWT (an XSS reading localStorage,
+                a leaked HAR) could lock the real operator out. */}
+            {settings?.admin_password_configured && (
+              <div>
+                <label className="block text-sm font-medium text-gray-400 mb-1.5">
+                  Current Password
+                </label>
+                <input
+                  type="password"
+                  value={passwordForm.current}
+                  onChange={(e) => setPasswordForm((p) => ({ ...p, current: e.target.value }))}
+                  placeholder="Required"
+                  autoComplete="current-password"
+                  className={inputClass + ' max-w-xs'}
+                />
+              </div>
+            )}
             <div>
               <label className="block text-sm font-medium text-gray-400 mb-1.5">New Password</label>
               <input
@@ -418,13 +587,27 @@ export default function SettingsPage() {
                 onChange={(e) =>
                   setPasswordForm((p) => ({ ...p, new_password: e.target.value }))
                 }
-                placeholder="Minimum 4 characters"
+                placeholder={`Minimum ${MIN_PASSWORD_LEN} characters`}
+                autoComplete="new-password"
                 className={inputClass + ' max-w-xs'}
               />
             </div>
+            <p className="text-xs text-amber-400/80">
+              Changing the password revokes every active session, including this one — you will be
+              signed out and must log in again.
+            </p>
             <button
-              onClick={() => passwordMutation.mutate({ value: passwordForm.new_password })}
-              disabled={passwordMutation.isPending || passwordForm.new_password.length < 4}
+              onClick={() =>
+                passwordMutation.mutate({
+                  current: passwordForm.current,
+                  value: passwordForm.new_password,
+                })
+              }
+              disabled={
+                passwordMutation.isPending ||
+                passwordForm.new_password.length < MIN_PASSWORD_LEN ||
+                (settings?.admin_password_configured && !passwordForm.current)
+              }
               className="flex items-center gap-2 px-4 py-2.5 bg-gray-800 hover:bg-gray-700 disabled:bg-gray-800 disabled:text-gray-600 text-gray-300 font-medium rounded-lg transition-colors"
             >
               {passwordMutation.isPending ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}

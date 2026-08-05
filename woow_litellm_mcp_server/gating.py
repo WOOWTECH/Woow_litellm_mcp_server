@@ -175,6 +175,66 @@ class ToolGate:
             f"console's Tools page, or use a read-only tool instead."
         )
 
+    # -- explanations ------------------------------------------------------
+    def explain_disabled(self, name: str) -> str | None:
+        """Explain, in one LLM-readable sentence, why ``name`` is not exposed.
+
+        Returns ``None`` when the tool IS exposed, or when the name is not in
+        the registry at all (an unknown name is a genuine "unknown tool" and
+        must keep the transport's default message).
+
+        This exists because gated tools are *unregistered*, not stubbed: a
+        client holding a stale ``tools/list`` that calls one gets FastMCP's
+        bare ``Unknown tool: 'litellm_generate_key'``, which reads like the
+        server is broken or the name is misspelled rather than like an
+        administrator deliberately switched it off. ``GatingMiddleware`` calls
+        this on every ``tools/call`` and turns the answer into a ToolError.
+        """
+        spec = TOOLS_BY_NAME.get(name)
+        if spec is None or self.is_tool_enabled(name):
+            return None
+
+        hint = (
+            " Call tools/list to refresh the currently available tool set, and "
+            "ask an administrator to re-enable it on the admin console's Tools "
+            "page if you need it."
+        )
+        category = (
+            spec.category.value
+            if isinstance(spec.category, ToolCategory)
+            else str(spec.category)
+        )
+        if not self.is_category_enabled(spec.category):
+            return (
+                f"Tool '{name}' is currently disabled: its whole category "
+                f"'{category}' has been switched off by the administrator.{hint}"
+            )
+        if spec.name in self._disabled_tools:
+            return (
+                f"Tool '{name}' is currently disabled: it was individually "
+                f"switched off by the administrator (or excluded by the "
+                f"permission policy).{hint}"
+            )
+        if self.readonly and spec.dangerous:
+            return (
+                f"Tool '{name}' is currently disabled: the server is in "
+                f"read-only mode and this tool performs destructive changes "
+                f"({'/'.join(spec.operations)}). Use a read-only tool "
+                f"instead.{hint}"
+            )
+        if self.readonly:
+            return (
+                f"Tool '{name}' is currently disabled: the server is in "
+                f"read-only mode and every operation this tool performs "
+                f"({'/'.join(spec.operations)}) is a write. Use a read-only "
+                f"tool instead.{hint}"
+            )
+        return (
+            f"Tool '{name}' is currently disabled: every operation it performs "
+            f"({'/'.join(spec.operations)}) is blocked by the operation "
+            f"policy.{hint}"
+        )
+
     # -- bulk views --------------------------------------------------------
     def enabled_tools(self) -> list[ToolSpec]:
         return [s for s in TOOL_REGISTRY if self.is_tool_enabled(s.name)]

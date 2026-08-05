@@ -23,6 +23,7 @@ from fastmcp import FastMCP
 
 from .gating import ToolGate
 from .lifespan import lifespan
+from .middleware import install as install_gating_middleware
 from .settings import get_settings
 from .tools import MODULES
 
@@ -52,6 +53,11 @@ def build_server(gate: ToolGate | None = None) -> FastMCP:
     )
     for module in MODULES:
         module.register(mcp, gate)
+    # Gated tools are unregistered, not stubbed, so calling one yields FastMCP's
+    # bare "Unknown tool: 'x'". This middleware intercepts tools/call for names
+    # that ARE in the registry but are gated off and replaces that with the
+    # actual reason. Clients cache tools/list, so this path is hit routinely.
+    install_gating_middleware(mcp, gate)
     logger.info(
         "Registered tools from %d modules; %d tools enabled by the gate.",
         len(MODULES),

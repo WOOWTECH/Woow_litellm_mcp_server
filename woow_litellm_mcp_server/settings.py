@@ -6,14 +6,29 @@ they line up with the connection section written by the admin console
 Secret used by the git-clone deployment.
 
 NEVER hard-code the master key here; it always comes from the environment.
+
+Two load-bearing rules govern the gating fields below; both exist because this
+class is constructed inside the MCP *child process* at import time, where a
+failure is invisible (the child dies before it can log anything useful):
+
+  1. ``NoDecode`` — the admin console writes the gating fields as JSON strings
+     (``litellm_mcp_admin.store.env_from_tool_settings``). Without ``NoDecode``
+     pydantic-settings tries to json-decode complex fields itself and *raises*
+     on anything that is not valid JSON (e.g. the legacy CSV form), killing the
+     process. With ``NoDecode`` the raw string reaches our own validator.
+  2. The ``mode="before"`` validator NEVER raises. A malformed gate value must
+     degrade to "nothing disabled" rather than take the whole server down; a
+     bad switch in the GUI must not be able to brick the MCP child.
 """
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from typing import Annotated, Any, Mapping
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _split_csv(value: object) -> list[str]:
@@ -23,6 +38,85 @@ def _split_csv(value: object) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(v).strip() for v in value if str(v).strip()]
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+# Sentinel returned when a value that was clearly *meant* to be JSON is
+# malformed. Such a value degrades to "nothing disabled" rather than being
+# mis-read as a CSV entry (a truncated '["litellm_delete_key"' must not become
+# the literal tool name '["litellm_delete_key').
+_BAD_JSON = object()
+
+
+def _maybe_json(value: str) -> Any:
+    """Decode a JSON string; never raises.
+
+    Returns the original string when it is plainly not JSON (the CSV form), or
+    :data:`_BAD_JSON` when it opens like JSON but fails to parse.
+    """
+    text = value.strip()
+    if not text or text[0] not in "[{\"":
+        return value
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return _BAD_JSON
+
+
+def _coerce_str_list(value: object) -> list[str]:
+    """Normalise a str-list env value, accepting (in order):
+
+    ``None``/``""`` -> empty; an already-parsed list/tuple/set; a JSON string
+    (``'["a","b"]'``, the form ``env_from_tool_settings`` writes); a CSV string
+    (``'a,b'``, the legacy form). Anything else degrades to empty.
+    """
+    try:
+        if value is None or value == "":
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return _split_csv(value)
+        if isinstance(value, Mapping):
+            # A mapping has no meaningful list form; treat its keys as the list.
+            return _split_csv(list(value.keys()))
+        if isinstance(value, str):
+            decoded = _maybe_json(value)
+            if decoded is _BAD_JSON:
+                return []
+            if isinstance(decoded, str):
+                return _split_csv(decoded)
+            return _coerce_str_list(decoded)
+        return _split_csv(value)
+    except Exception:  # pragma: no cover - defensive: must never kill the child
+        return []
+
+
+def _coerce_operations(value: object) -> list[str] | dict[str, list[str]]:
+    """Normalise ``disabled_operations``, keeping BOTH accepted shapes.
+
+    The admin GUI stores the mapping form ``{tool: [op, ...]}``; the legacy env
+    form is a flat list of ``"tool:op"`` / ``"op"`` strings.
+    ``gating._normalize_operations`` understands both, so we pass the shape
+    through rather than lossily flattening it here.
+    """
+    try:
+        if value is None or value == "":
+            return []
+        if isinstance(value, Mapping):
+            return {
+                str(tool): _split_csv(ops)
+                for tool, ops in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return _split_csv(value)
+        if isinstance(value, str):
+            decoded = _maybe_json(value)
+            if decoded is _BAD_JSON:
+                return []
+            if isinstance(decoded, str):
+                return _split_csv(decoded)
+            return _coerce_operations(decoded)
+        return _split_csv(value)
+    except Exception:  # pragma: no cover - defensive: must never kill the child
+        return []
 
 
 class Settings(BaseSettings):
@@ -47,21 +141,30 @@ class Settings(BaseSettings):
     )
 
     # --- gating --------------------------------------------------------------
+    # NOTE: readonly drops every tool that has a non-``read`` operation, not
+    # just the ones flagged ``dangerous`` (see gating.ToolGate.is_tool_enabled).
     readonly: bool = Field(
         default=False,
         description="When true, every dangerous/mutating tool is dropped.",
     )
-    disabled_categories: list[str] = Field(
+    # ``NoDecode`` on all three: the value arrives as a JSON string and MUST be
+    # parsed by our forgiving validator, not by pydantic-settings' strict one.
+    disabled_categories: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         description="Tool categories to disable entirely (e.g. 'chat,users').",
     )
-    disabled_tools: list[str] = Field(
+    disabled_tools: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         description="Individual tool names to disable (e.g. 'litellm_delete_key').",
     )
-    disabled_operations: list[str] = Field(
+    disabled_operations: Annotated[
+        dict[str, list[str]] | list[str], NoDecode
+    ] = Field(
         default_factory=list,
-        description="Operation gates, 'tool:op' or bare 'op', to disable.",
+        description=(
+            "Operation gates: either the mapping form {tool: [op, ...]} written "
+            "by the admin GUI, or a flat list of 'tool:op' / 'op' strings."
+        ),
     )
 
     # --- paging / limits -----------------------------------------------------
@@ -75,15 +178,17 @@ class Settings(BaseSettings):
         default=60.0, gt=0, description="Per-request HTTP timeout in seconds."
     )
 
-    @field_validator(
-        "disabled_categories",
-        "disabled_tools",
-        "disabled_operations",
-        mode="before",
-    )
+    @field_validator("disabled_categories", "disabled_tools", mode="before")
     @classmethod
-    def _coerce_csv(cls, value: object) -> list[str]:
-        return _split_csv(value)
+    def _coerce_str_list_field(cls, value: object) -> list[str]:
+        return _coerce_str_list(value)
+
+    @field_validator("disabled_operations", mode="before")
+    @classmethod
+    def _coerce_operations_field(
+        cls, value: object
+    ) -> list[str] | dict[str, list[str]]:
+        return _coerce_operations(value)
 
     @field_validator("base_url", mode="before")
     @classmethod
@@ -105,6 +210,15 @@ def get_settings() -> Settings:
     return Settings()
 
 
-# Convenience module-level singleton (evaluated lazily on first access via the
-# cached factory; import ``get_settings`` where you need testable overrides).
-settings = get_settings()
+def __getattr__(name: str) -> Any:
+    """Lazily materialise the module-level ``settings`` singleton.
+
+    Importing this module must NEVER construct ``Settings()``: a bad env value
+    would then explode during ``import``, before any handler exists to report
+    it, and the MCP child process would die silently. ``settings`` is therefore
+    resolved on first *attribute access* via the cached factory. Prefer
+    ``get_settings()`` in new code — it is the testable entry point.
+    """
+    if name == "settings":
+        return get_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

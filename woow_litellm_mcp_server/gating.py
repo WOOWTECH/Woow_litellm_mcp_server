@@ -7,17 +7,28 @@ never even registered on the FastMCP server.
 Precedence (a tool is enabled only if ALL hold):
   1. its category is not in ``disabled_categories``;
   2. its name is not in ``disabled_tools``;
-  3. read-only mode is off OR the tool is not ``dangerous``.
+  3. read-only mode is off OR the tool is not ``dangerous``;
+  4. at least one of the tool's declared operations is still allowed.
+
+Rule 4 is what makes the operations column in the admin GUI real. Every tool in
+the registry declares exactly the operations it performs, so disabling the only
+operation a tool has (or turning on read-only, which disables every non-``read``
+operation) removes the tool from the surface entirely — it is never registered
+on the FastMCP server, so ``tools/list`` shrinks and ``tools/call`` 404s.
 
 Operation gating additionally filters the operations a still-enabled tool may
 perform via ``disabled_operations`` (entries may be ``"tool:op"`` or bare
-``"op"``); in read-only mode only the ``read`` operation survives.
+``"op"``); in read-only mode only the ``read`` operation survives. Mutating
+tools additionally call :meth:`ToolGate.require_operation` in their handler
+body, so a gate that changes shape between registration and invocation still
+refuses the upstream call instead of performing it.
 """
 
 from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from .errors import ToolError
 from .registry import (
     OP_READ,
     TOOL_REGISTRY,
@@ -115,6 +126,12 @@ class ToolGate:
             return False
         if self.readonly and spec.dangerous:
             return False
+        # A tool with no surviving operation is not a tool. This is the check
+        # that enforces `disabled_operations` (previously dead code: the GUI's
+        # operation switches were decorative) and closes the read-only hole
+        # where 15 mutating-but-not-`dangerous` tools stayed live.
+        if not self.allowed_operations(name):
+            return False
         return True
 
     # -- operation ---------------------------------------------------------
@@ -133,6 +150,29 @@ class ToolGate:
             return ()
         return tuple(
             op for op in spec.operations if self.is_operation_allowed(name, op)
+        )
+
+    def require_operation(self, name: str, operation: str) -> None:
+        """Raise unless ``operation`` is allowed for ``name``.
+
+        Called from the body of every mutating tool immediately before it talks
+        to LiteLLM. Registration-time gating already hides such tools, so this
+        is the second line of defence: it guarantees a gated operation can never
+        reach the gateway even if the tool was registered by an older/looser
+        gate, and it turns the refusal into an explicit, LLM-readable message
+        instead of a silent success.
+        """
+        if self.is_operation_allowed(name, operation):
+            return
+        reason = (
+            "the server is in read-only mode"
+            if self.readonly and operation != OP_READ
+            else "it is disabled by the operation policy"
+        )
+        raise ToolError(
+            f"Operation '{operation}' on tool '{name}' is not permitted: "
+            f"{reason}. Ask an administrator to enable it in the admin "
+            f"console's Tools page, or use a read-only tool instead."
         )
 
     # -- bulk views --------------------------------------------------------

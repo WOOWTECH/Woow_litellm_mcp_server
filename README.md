@@ -116,7 +116,7 @@ The suite is one container running one uvicorn process that fronts three things:
 admin API, the SPA, and a reverse proxy to a loopback-bound MCP child.
 
 ```
-                       ┌──────────────────────── single container ──────────────────────┐
+                       ┌─────────────────────── single container ───────────────────────────┐
   Claude / MCP client  │                                                                      │
         │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)                │
         │  HTTPS       │    ├─ AuthMiddleware (JWT)  ── /api/*  admin GUI + API               │
@@ -125,7 +125,7 @@ admin API, the SPA, and a reverse proxy to a loopback-bound MCP child.
                        │                                       ▼                              │
                        │             McpProcessManager ► woow_litellm_mcp_server (127.0.0.1)  │
                        │                                       │  transport=http  /mcp/       │
-                       └────────────────────────────────────┼──────────────────────────┘
+                       └────────────────────────────────────────┼──────────────────────────────┘
                                                                ▼
                                         LiteLLM gateway  (Bearer master key, port 4000)
 ```
@@ -200,7 +200,7 @@ can reject it.
     │                  │                 │                   │                │ route ───────►│
     │                  │                 │                   │                │◄── completion │
     │                  │                 │                   │◄── JSON        │               │
-    │◄──────────────── structured MCP result ────────────│                │               │
+    │◄──────────────── structured MCP result ────────────────│                │               │
 ```
 
 ```mermaid
@@ -317,7 +317,7 @@ single value because a few tools legitimately span two verbs.
 Two namespaces, two deployments, one shared cluster DNS name between them.
 
 ```
-  ┌── namespace: litellm ────────────┐   ┌── namespace: litellm-mcp ──────────────┐
+  ┌── namespace: litellm ─────────────┐   ┌── namespace: litellm-mcp ──────────────────┐
   │                                   │   │                                            │
   │  Deployment  litellm              │   │  Deployment  litellm-mcp-admin             │
   │   image ghcr.io/berriai/litellm   │   │   strategy: Recreate                       │
@@ -326,7 +326,7 @@ Two namespaces, two deployments, one shared cluster DNS name between them.
   │  Service  litellm  :4000  ◄───────┼───┼──   └─ init  seed-config   python:3.12-slim│
   │                                   │   │   └─ main  admin           :8080           │
   │  Secret   master key, salt key    │   │  PVC  litellm-mcp-data → /data/config.json │
-  └───────────────────────────────┘   └──────────────────────────────────────────┘
+  └─────────────────────────────────┘   └────────────────────────────────────────────┘
                   ▲                                          ▲
                   │ Cloudflare tunnel                        │ Cloudflare tunnel
            litellm.woowtech.io                       litellm-mcp.woowtech.io
@@ -349,7 +349,7 @@ flowchart LR
             I3["seed-config<br/>python:3.12-slim"]
         end
         D2["Deployment litellm-mcp-admin<br/>strategy: Recreate · :8080"]
-        PVC[("PVC litellm-mcp-data<br/>/data/config.json")]
+        PVC[("PVC litellm-mcp-data<br;>/data/config.json")]
         I1 --> I2 --> I3 --> D2
         PVC --- D2
     end

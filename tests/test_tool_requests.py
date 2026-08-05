@@ -139,13 +139,14 @@ async def test_enable_plugin_posts_to_named_path() -> None:
     assert result == {"enabled": True}
 
 
-async def test_update_model_folds_the_id_into_model_info() -> None:
-    """LiteLLM resolves the deployment ONLY from model_info.id.
+async def test_update_model_patches_the_id_scoped_path() -> None:
+    """The deployment is addressed by URL, and model_info still carries the id.
 
-    A top-level "model_id" is discarded, so the schema-conformant call used to
-    400 with "model_info not provided" every single time.
+    LiteLLM's PATCH handler resolves the row from the path segment, but the
+    stored ``model_info`` blob is merged rather than replaced, so echoing the
+    id back is free and keeps the two representations agreeing.
     """
-    gw = MockLiteLLM().route("/model/update", {"model_id": "m-1"})
+    gw = MockLiteLLM().route("/model/m-1/update", {"model_id": "m-1"})
     tool = _register(models_mod)["litellm_update_model"]
     await _call(
         gw,
@@ -154,6 +155,8 @@ async def test_update_model_folds_the_id_into_model_info() -> None:
         litellm_params={"model": "openai/gpt-4o"},
         model_info={"mode": "chat"},
     )
+    assert gw.last.method == "PATCH"
+    assert gw.last.url.path == "/model/m-1/update"
     body = gw.last_json()
     assert body["model_info"]["id"] == "m-1"
     assert body["model_info"]["mode"] == "chat"

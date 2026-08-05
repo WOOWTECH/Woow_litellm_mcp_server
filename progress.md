@@ -229,20 +229,60 @@ Post-delete verification: one Deployment (`litellm-mcp-admin`, `1/1`), one Servi
 (`litellm-mcp-admin:8080`), one pod (`litellm-mcp-admin-749b47fb6c-zm9zg`, `Running`,
 **0 restarts** — the console was not disturbed by the deletion), both Secrets present.
 
-### What is deliberately *not* done
+---
 
-The FINDING-004 `setdefault` fix lives in the manifest, not in the running Deployment
-object. Landing it needs `kubectl apply -f k8s-admin-deploy.yaml`, and under
-`strategy: Recreate` with a 2.5–3 minute cold start that means the console and the public
-MCP endpoint go down for the duration. Not performed unprompted. Recorded as OPEN-7.
+## Phase 7 — Landing the FINDING-004 fix on the cluster · complete
+
+Phase 6 left the `setdefault` fix in the manifest only; the running Deployment object
+still embedded the old script that reverted console-side password and token changes on
+every restart. That was recorded as OPEN-7 and deliberately not performed unprompted,
+because `strategy: Recreate` takes the console and the public MCP endpoint down for a
+2.5–3 minute cold start. The user authorised the downtime, and it was carried out on
+5 August 2026.
+
+Two hazards shaped the procedure. First, `k8s-admin-deploy.yaml` opens with
+`Secret/litellm-mcp-admin-secret` holding **placeholder** credentials, so applying the
+whole file would have reset the live admin password, JWT secret and proxy token to
+placeholders at the same moment the pod restarted. Only the `Deployment` document was
+applied — extracted to a standalone file and verified byte-identical to the repository
+text before sending. Second, the *old* script was still the one running at apply time, so
+the restart would rebuild the config from the Secret; had the Secret drifted from the PVC,
+the live `mcp_auth_token` would have flipped and killed the connected client. The two were
+proved equal beforehand using sha256 digests only — an ephemeral pod mounted both Secrets
+and printed 12-character digests and lengths, never values, and was then deleted. All four
+digests matched.
+
+| Step | Result |
+|---|---|
+| Back up `/data/config.json` | `/data/config.json.pre-open7-20260805.bak` (added to OPEN-3) |
+| Secret ⟷ PVC digest comparison | all four match — restart cannot change credentials |
+| Diff live Deployment vs manifest | only the two `setdefault` lines and the comment block differ |
+| Apply the single `Deployment` document | field manager `kubernetes-mcp-server`, no SSA conflict; generation 3 |
+| Rollout | `…-749b47fb6c-zm9zg` → `…-59758cc76c-6hqbj`, `1/1`, **0 restarts**, ~4 minutes |
+| Config after restart | byte-identical: sha256 prefix `266e6eab84873668`, 1044 bytes, mode `0600` |
+| Public chain | `litellm_health_readiness` via Cloudflare → console → loopback child → LiteLLM returns `healthy` |
+| Behavioural regression test | deployed script re-run over synthetic configs — all assertions pass |
+
+The regression test is the part worth trusting: rather than reading the applied YAML back
+and calling it done, the seed script was extracted *from the running object* and executed
+against synthetic configs. It confirms that first boot seeds both credentials from the
+Secret, that a restart after a GUI-side password change and token rotation leaves both GUI
+values intact, that `connection` is still refreshed from the Secret every time, and that
+the child's gating env, `token_history` and the legacy `tools.disabled` migration all
+survive. OPEN-6 and OPEN-7 are both closed; FINDING-004 is fully fixed.
+
+One rule came out of this and is now recorded in `findings.md`: `k8s-admin-deploy.yaml` is
+a bootstrap manifest, not a reconciliation target. Apply the whole file only on first
+install; against a live cluster, apply the `Deployment` document alone.
 
 ---
 
 ## Settings touched
 
-No configuration value on the admin console was changed at any point across Phases 1–6;
+No configuration value on the admin console was changed at any point across Phases 1–7;
 every interaction with the console was a read or a navigation, so Constraint #5 has
-nothing to restore there.
+nothing to restore there. Phase 7 restarted the pod but did not alter its configuration:
+`/data/config.json` is byte-identical before and after, verified by sha256.
 
 Two cluster objects were **deleted** in Phase 6 — `Deployment/litellm-mcp-server` and
 `Service/litellm-mcp` — at the user's explicit instruction. These are intentionally not

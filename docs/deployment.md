@@ -129,9 +129,10 @@ in the Secret must reach the console on the next restart.
 > all four keys, which meant a password change or token rotation made in the console
 > silently reverted on the next pod restart — a rotated token kept working until an
 > eviction and then died with nothing to blame. That is FINDING-004 in
-> [`findings.md`](../findings.md), fixed in `k8s-admin-deploy.yaml`. A cluster running the
-> old manifest keeps the old behaviour until the manifest is re-applied, and under
-> `strategy: Recreate` re-applying means a short console outage — schedule it.
+> [`findings.md`](../findings.md). A cluster running the old manifest keeps the old
+> behaviour until the Deployment object is re-applied; see
+> [Re-applying to a running cluster](#re-applying-to-a-running-cluster) below, which is
+> not a plain `kubectl apply -f` of this file.
 
 The one legacy migration it performs is folding a pre-existing `tools.disabled` list
 into `tools.disabled_tools` and dropping the old key, so a reader never sees both.
@@ -157,6 +158,10 @@ there is no way to pin a commit without editing the manifest.
 Two manifests, applied in order. `k8s-base.yaml` carries the namespace and the gateway
 credentials and **no workload**; `k8s-admin-deploy.yaml` carries the entire console
 stack.
+
+This section is for an **empty cluster**. Both manifests seed credentials with
+placeholders, so applying either one wholesale over a running install destroys live
+secrets — see [Re-applying to a running cluster](#re-applying-to-a-running-cluster).
 
 ```bash
 # 1. Namespace + Secret/litellm-mcp-secret.
@@ -197,6 +202,54 @@ from the Settings page is now safe on its own: `seed-config` uses `setdefault` f
 `admin_password`, so `/data/config.json` wins from the first boot onward and the Secret
 is not consulted again. Updating the Secret to match is still good hygiene — it is what a
 freshly provisioned PVC would seed from.
+
+---
+
+## Re-applying to a running cluster
+
+`k8s-admin-deploy.yaml` is a bootstrap manifest, not a reconciliation target. Its first
+document is `Secret/litellm-mcp-admin-secret` with placeholder credentials, so on a live
+cluster `kubectl apply -f k8s-admin-deploy.yaml` resets `ADMIN_PASSWORD`,
+`MCP_AUTH_TOKEN` and `JWT_SECRET` to the literal `REPLACE_ME…` strings. That locks you out
+of the console and breaks every client bound to the current `/private_{token}/mcp/` URL,
+at the same moment the pod is restarting. Apply the `Deployment` document alone:
+
+```bash
+# Extract document 3 (the Deployment) and nothing else.
+python - <<'PY' > /tmp/deploy.yaml
+print(open('k8s-admin-deploy.yaml').read().split('\n---\n')[2])
+PY
+kubectl apply -f /tmp/deploy.yaml
+```
+
+Before applying, run through this:
+
+1. **Back up the config.** `kubectl exec -n litellm-mcp deploy/litellm-mcp-admin -c admin
+   -- cp /data/config.json /data/config.json.pre-upgrade.bak`. Prune old backups
+   afterwards — each one is a full copy of the credentials.
+2. **Check the Secret against the PVC.** This matters only when the *current* pod predates
+   FINDING-004, because that version rebuilds the config from the Secret on every start:
+   if the two have drifted, the restart flips the live `mcp_auth_token` and kills connected
+   clients. Compare by digest, never by printing values — mount both secrets into a
+   throwaway pod and `sha256sum` each, then diff against the same digests taken from
+   `/data/config.json`. If they disagree, update the Secret to the live values first.
+3. **Diff the object against the manifest** so you know what the apply will actually
+   change. `kubectl get deploy litellm-mcp-admin -n litellm-mcp -o yaml` and compare the
+   pod template.
+4. **Expect downtime.** `strategy: Recreate` plus a 2.5–3 minute cold start means the
+   console *and* the public MCP endpoint are unavailable for roughly three to four
+   minutes. There is no zero-downtime path while the config PVC is `ReadWriteOnce`.
+
+Afterwards, verify rather than assume: the new pod should be `1/1` with **0 restarts**,
+`/data/config.json` should be unchanged (compare the sha256 against the backup), and an
+end-to-end call through the public URL should succeed. If the change touched
+`seed-config`, extract the script from the *running* object and exercise it against a
+synthetic config — reading the YAML back only proves the apply landed, not that the script
+behaves.
+
+If all you need is to pick up new code from `main`, you do not need an apply at all:
+`/repo` is an emptyDir re-cloned on every start, so
+`kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp` is enough.
 
 ---
 

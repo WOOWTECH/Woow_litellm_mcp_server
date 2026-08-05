@@ -2,22 +2,62 @@
 
 Generation and rotation are deliberately separate — previewing a token must
 not invalidate the one AI clients are currently using.
+
+The history entries written here are the shared contract with
+``mcp_admin_core.routers.settings`` (the other rotate endpoint) and with the
+React ``TokenManager`` page: exactly ``{"masked": …, "rotated_at": …}``. The two
+writers used to disagree (one wrote ``{"token_masked": …}``, the other a bare
+string), so the page rendered "[object Object]" — or crashed React outright by
+being handed a raw object as a child — depending on which endpoint had last
+rotated.
 """
 
 from __future__ import annotations
 
 import secrets
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter
 
+from ..store import mask_secret
+
 router = APIRouter(prefix="/api/tokens", tags=["tokens"])
 
-_KEEP_HISTORY = 5
+# The page shows a short audit trail; ten rotations is enough to answer "when
+# did this change?" without growing config.json without bound.
+_KEEP_HISTORY = 10
 
 
-def _mask(token: str) -> str:
-    return f"{token[:4]}…{token[-4:]}" if len(token) > 8 else "…"
+def _history_entry(token: str) -> dict[str, str]:
+    """One audit row for a token that has just been retired."""
+    return {
+        "masked": mask_secret(token),
+        "rotated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _normalise_history(history: Any) -> list[dict[str, str]]:
+    """Coerce older shapes into the contract the SPA renders.
+
+    Config files written by earlier builds hold bare strings or
+    ``{"token_masked": …}``; passing either straight through meant the page
+    printed "[object Object]" or masked nothing at all.
+    """
+    entries: list[dict[str, str]] = []
+    for item in list(history or []):
+        if isinstance(item, dict):
+            masked = item.get("masked") or item.get("token_masked") or ""
+            entries.append(
+                {
+                    "masked": str(masked),
+                    "rotated_at": str(item.get("rotated_at") or item.get("at") or ""),
+                }
+            )
+        else:
+            # A legacy bare string is already masked; keep it, timestamp unknown.
+            entries.append({"masked": str(item), "rotated_at": ""})
+    return entries[:_KEEP_HISTORY]
 
 
 @router.get("")
@@ -27,9 +67,11 @@ async def get_token() -> dict[str, Any]:
     store = get_config_store()
     token = await store.get("mcp_auth_token", "")
     return {
-        "masked": _mask(token) if token else "",
+        # Never more than four leading characters: the token is the only thing
+        # standing between the public proxy URL and the MCP server.
+        "masked": mask_secret(token),
         "configured": bool(token),
-        "history": await store.get("token_history", []),
+        "history": _normalise_history(await store.get("token_history", [])),
     }
 
 
@@ -49,9 +91,10 @@ async def rotate_token() -> dict[str, Any]:
     previous = await store.get("mcp_auth_token", "")
     token = secrets.token_urlsafe(32)
 
-    history = await store.get("token_history", [])
+    history = _normalise_history(await store.get("token_history", []))
     if previous:
-        history = ([{"masked": _mask(previous)}] + list(history))[:_KEEP_HISTORY]
+        # Newest first — the page lists the most recent rotation at the top.
+        history = ([_history_entry(previous)] + history)[:_KEEP_HISTORY]
 
     await store.put("mcp_auth_token", token)
     await store.put("token_history", history)
@@ -61,4 +104,11 @@ async def rotate_token() -> dict[str, Any]:
     if manager.is_running and not await manager.restart():
         status = "partial"
 
-    return {"token": token, "masked": _mask(token), "status": status}
+    # The plaintext token is returned exactly once, on the response to the
+    # rotation that minted it; every later read is masked.
+    return {
+        "token": token,
+        "masked": mask_secret(token),
+        "status": status,
+        "history": history,
+    }

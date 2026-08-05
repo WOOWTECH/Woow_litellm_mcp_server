@@ -9,6 +9,7 @@ not found, validation error) and surfaces the LiteLLM error body verbatim.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -46,6 +47,57 @@ def _extract_error_body(response: httpx.Response) -> str:
         if payload.get("message"):
             return str(payload["message"])
     return json.dumps(payload)
+
+
+# A 401 out of LiteLLM has two completely different causes that need two
+# completely different fixes, and the body is the only thing that tells them
+# apart. Either OUR master key was rejected by the proxy (fix: the operator's
+# LITELLM_MCP_MASTER_KEY), or the proxy authenticated us fine and the model's
+# *upstream provider* rejected LiteLLM's credential (fix: that deployment's
+# api_key — nothing to do with us). Blaming the master key for the second case
+# sends an operator to rotate a key that was never wrong.
+_PROVIDER_AUTH_MARKERS = (
+    "litellm.authenticationerror",
+    "authenticationerror:",
+    "invalid api key",
+    "incorrect api key",
+    "no auth credentials found",
+)
+#: LiteLLM names upstream failures ``OpenrouterException``, ``OpenAIException``,
+#: ``AnthropicException``… — a reliable "this came from the provider" tell.
+_PROVIDER_EXCEPTION_RE = re.compile(r"\b[A-Z][A-Za-z0-9]*Exception\b")
+
+#: …but the proxy's own rejection wins if both are somehow present, because
+#: these strings only ever come from LiteLLM's own key-auth layer.
+_PROXY_AUTH_MARKERS = (
+    "invalid proxy server token",
+    "invalid user key",
+    "no api key passed",
+    "no api key provided",
+)
+
+#: The community edition answers Enterprise-only endpoints with a wall of
+#: marketing copy. Retrying cannot help; the caller needs to know that.
+_ENTERPRISE_MARKERS = (
+    "enterprise feature",
+    "litellm_license",
+    "litellm enterprise",
+    "litellm.ai/enterprise",
+)
+
+
+def _is_provider_auth_failure(body: str) -> bool:
+    lowered = body.lower()
+    if any(marker in lowered for marker in _PROXY_AUTH_MARKERS):
+        return False
+    if any(marker in lowered for marker in _PROVIDER_AUTH_MARKERS):
+        return True
+    return bool(_PROVIDER_EXCEPTION_RE.search(body))
+
+
+def _is_enterprise_gate(body: str) -> bool:
+    lowered = body.lower()
+    return any(marker in lowered for marker in _ENTERPRISE_MARKERS)
 
 
 def json_body(response: httpx.Response) -> Any:
@@ -106,7 +158,29 @@ async def litellm_request(
 
     body = _extract_error_body(response)
     status = response.status_code
+    # Checked before the per-status branches: the enterprise gate answers with
+    # whatever status it likes (500 for /key/*/regenerate) and the status alone
+    # would send the caller off to debug a server fault that does not exist.
+    if _is_enterprise_gate(body):
+        raise LiteLLMApiError(
+            f"{method.upper()} {path} is a LiteLLM Enterprise-only feature and "
+            f"this gateway runs the community edition, so it answered {status}. "
+            f"Nothing about the request was wrong and retrying will not help — "
+            f"use a different approach (for example, delete and re-create a key "
+            f"instead of regenerating it) or have the operator set "
+            f"LITELLM_LICENSE. Details: {body}"
+        )
     if status == 401:
+        if _is_provider_auth_failure(body):
+            raise LiteLLMApiError(
+                f"The LiteLLM gateway accepted this request but the model's "
+                f"upstream provider rejected LiteLLM's own credential (401). "
+                f"The MCP server's master key is NOT the problem — do not "
+                f"rotate it. Check that deployment's api_key: a model added via "
+                f"litellm_add_model with an 'os.environ/NAME' api_key stores "
+                f"that text literally and 401s forever, so re-add it with the "
+                f"key omitted or with the real secret. Details: {body}"
+            )
         raise LiteLLMApiError(
             "LiteLLM rejected the credentials (401 Unauthorized). The "
             "LITELLM_MCP_MASTER_KEY is missing or wrong. Details: " + body

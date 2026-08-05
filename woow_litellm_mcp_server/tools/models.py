@@ -7,9 +7,46 @@ from typing import Any
 from fastmcp import Context
 
 from ..deps import litellm_client
+from ..errors import ToolError
 from ..gating import ToolGate
 from ..registry import OP_CREATE, OP_DELETE, OP_UPDATE
 from ._common import destructive, prune_none, read_only, writing
+
+#: Prefix LiteLLM uses in its *config file* to mean "read this from the
+#: environment". The REST API does NOT expand it — see :func:`_reject_env_refs`.
+_ENV_REF_PREFIX = "os.environ/"
+
+
+def _reject_env_refs(litellm_params: dict[str, Any]) -> None:
+    """Refuse ``os.environ/NAME`` values, which silently create a dead model.
+
+    ``os.environ/OPENROUTER_API_KEY`` is valid in LiteLLM's *config.yaml*, where
+    the loader expands it at startup. ``POST /model/new`` does no such thing: it
+    encrypts the literal text ``os.environ/OPENROUTER_API_KEY`` and stores that
+    as the credential. The call returns 200, the deployment shows up in
+    ``/model/info``, and then every single completion through it fails with an
+    upstream 401 forever. That is the worst possible failure shape — it looks
+    like success — so it is rejected up front, naming the two fixes that
+    actually work.
+    """
+    offenders = sorted(
+        key
+        for key, value in litellm_params.items()
+        if isinstance(value, str) and value.startswith(_ENV_REF_PREFIX)
+    )
+    if not offenders:
+        return
+    raise ToolError(
+        "litellm_params "
+        + ", ".join(repr(k) for k in offenders)
+        + " uses the 'os.environ/NAME' form, which only works in LiteLLM's "
+        "config.yaml. The model-management REST API stores that text verbatim "
+        "as the secret, so the model would be saved successfully and then fail "
+        "every request with an upstream 401. Either omit the key entirely (LiteLLM "
+        "falls back to the provider environment variable the gateway process "
+        "already has, which is the usual answer for api_key) or pass the real "
+        "secret value."
+    )
 
 
 def register(mcp: Any, gate: ToolGate) -> None:
@@ -72,10 +109,17 @@ def register(mcp: Any, gate: ToolGate) -> None:
         ) -> dict:
             """Register a new model deployment.
 
-            ``litellm_params`` holds at least ``{"model": ..., "api_base": ...,
-            "api_key": ...}``; ``model_info`` carries optional metadata.
+            ``litellm_params`` holds at least ``{"model": ..., "api_base":
+            ...}``; ``model_info`` carries optional metadata.
+
+            Do NOT pass ``api_key: "os.environ/SOMETHING"``. That indirection is
+            a config.yaml feature and is not expanded by this API — it would be
+            stored as the literal secret and the model would 401 on every
+            request. Omit ``api_key`` to use the provider credential the gateway
+            process already holds, or pass the real secret.
             """
             gate.require_operation("litellm_add_model", OP_CREATE)
+            _reject_env_refs(litellm_params)
             body = prune_none(
                 {
                     "model_name": model_name,
@@ -105,8 +149,14 @@ def register(mcp: Any, gate: ToolGate) -> None:
             of ``model_info`` on this endpoint — other metadata keys you pass
             there are accepted but not stored, so re-read with
             ``litellm_model_info`` if you need to confirm a metadata change.
+
+            Omitting ``litellm_params`` leaves the deployment's routing and
+            credentials untouched; the same ``os.environ/`` restriction as
+            ``litellm_add_model`` applies to any value you do pass.
             """
             gate.require_operation("litellm_update_model", OP_UPDATE)
+            if litellm_params:
+                _reject_env_refs(litellm_params)
             # LiteLLM's /model/update resolves the deployment EXCLUSIVELY from
             # model_info.id and discards a top-level "model_id"; sending only
             # model_id fails with "model_info not provided". Fold it in (last,
@@ -117,9 +167,19 @@ def register(mcp: Any, gate: ToolGate) -> None:
             body = prune_none(
                 {
                     "model_name": model_name,
-                    "litellm_params": litellm_params,
                     "model_info": merged_info,
                 }
+            )
+            # litellm_params is deliberately NOT run through prune_none and is
+            # never dropped. LiteLLM's update handler raises a bare
+            # "litellm_params not provided" (surfaced as a 400 that reads like a
+            # caller mistake) the moment the field is absent, so a
+            # rename-only or metadata-only update used to be impossible. It then
+            # merges the object field by field against the stored deployment, so
+            # {} means "change nothing here" and leaves the existing
+            # model/api_base/api_key exactly as they were.
+            body["litellm_params"] = (
+                litellm_params if litellm_params is not None else {}
             )
             return await litellm_client(ctx).post(
                 "/model/update", json_data=body

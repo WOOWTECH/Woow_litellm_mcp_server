@@ -25,9 +25,31 @@ def register(mcp: Any, gate: ToolGate) -> None:
 
             Optionally restrict the check to a single ``model``. Returns the
             healthy/unhealthy endpoint lists.
+
+            An all-zero result for a ``model`` filter means *no deployment
+            matched the name*, not "everything is fine" — a ``note`` is added to
+            the payload in that case.
             """
             params = prune_none({"model": model})
-            return await litellm_client(ctx).get("/health", params=params)
+            result = await litellm_client(ctx).get("/health", params=params)
+            # LiteLLM answers an unknown model with the same zeroed envelope it
+            # uses for "nothing to report", so `unhealthy_count: 0` reads as
+            # healthy. Distinguish the two rather than letting a typo look green.
+            if (
+                model
+                and isinstance(result, dict)
+                and not result.get("healthy_endpoints")
+                and not result.get("unhealthy_endpoints")
+            ):
+                result = {
+                    **result,
+                    "note": (
+                        f"No deployment matched model={model!r}, so these zero "
+                        f"counts do NOT mean the model is healthy. Call "
+                        f"litellm_list_models for valid model_name values."
+                    ),
+                }
+            return result
 
     if gate.is_tool_enabled("litellm_health_readiness"):
 

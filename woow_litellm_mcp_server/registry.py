@@ -114,9 +114,14 @@ TOOL_REGISTRY: tuple[ToolSpec, ...] = (
        operations=(OP_UPDATE,), dangerous=True),
     _t("litellm_unblock_key", _K, "POST", "/key/unblock",
        "Re-enable a previously blocked key.", operations=(OP_UPDATE,)),
-    _t("litellm_regenerate_key", _K, "POST", "/key/regenerate",
-       "Rotate the secret of an existing key while preserving its config.",
-       operations=(OP_UPDATE,)),
+    # The key is a PATH SEGMENT, not a body field (tools/keys.py posts to
+    # /key/{key}/regenerate). Keep this in sync — the admin Tool Manager and any
+    # gateway-side allow-list are generated from spec.path.
+    # Rotation is irreversible (every holder of the old secret breaks
+    # immediately), so it is `dangerous` even though it is an UPDATE.
+    _t("litellm_regenerate_key", _K, "POST", "/key/{key}/regenerate",
+       "[DESTRUCTIVE] Rotate the secret of an existing key; the old value dies.",
+       operations=(OP_UPDATE,), dangerous=True),
     # --- teams ------------------------------------------------------------
     _t("litellm_create_team", _TE, "POST", "/team/new",
        "Create a team.", operations=(OP_CREATE,)),
@@ -142,16 +147,24 @@ TOOL_REGISTRY: tuple[ToolSpec, ...] = (
        "List/paginate users."),
     _t("litellm_user_info", _U, "GET", "/user/info",
        "Get one user's teams, keys, budget and spend by user_id."),
+    # NB: no `teams` — UpdateUserRequest has no such field (use
+    # litellm_team_member_add/delete); passing it was a silent no-op.
     _t("litellm_update_user", _U, "POST", "/user/update",
-       "Update user role/budget/teams/models.", operations=(OP_UPDATE,)),
+       "Update user role/budget/models/alias/email.", operations=(OP_UPDATE,)),
     _t("litellm_delete_user", _U, "POST", "/user/delete",
        "[DESTRUCTIVE] Delete users by user_ids[].",
        operations=(OP_DELETE,), dangerous=True),
     # --- spend ------------------------------------------------------------
     _t("litellm_spend_logs", _S, "GET", "/spend/logs",
        "Fetch per-request spend logs."),
-    _t("litellm_global_spend_report", _S, "GET", "/global/spend/report",
-       "Aggregated spend report grouped by team/key/user/customer."),
+    # /global/spend/report is LiteLLM *Enterprise*-only and 400s on a community
+    # gateway, so the tool is built on /spend/logs (client-side aggregation)
+    # with /global/spend/{teams,keys} as fallbacks. spend.py owns that fan-out;
+    # the primary endpoint is recorded here.
+    _t("litellm_global_spend_report", _S, "GET", "/spend/logs",
+       "Aggregated spend report grouped by team/key/user/customer/model "
+       "(community-edition safe: aggregates /spend/logs, falls back to "
+       "/global/spend/teams and /global/spend/keys)."),
     _t("litellm_spend_calculate", _S, "POST", "/spend/calculate",
        "Estimate cost for a model + messages or a completion_response."),
     # --- health -----------------------------------------------------------
@@ -162,8 +175,18 @@ TOOL_REGISTRY: tuple[ToolSpec, ...] = (
     # --- plugins (Claude-Code skill hub) ----------------------------------
     _t("litellm_list_plugins", _P, "GET", "/claude-code/plugins",
        "List Claude-Code skill-hub plugins."),
+    _t("litellm_plugin_info", _P, "GET", "/claude-code/plugins/{plugin_name}",
+       "Get one skill-hub plugin's record by name."),
     _t("litellm_register_plugin", _P, "POST", "/claude-code/plugins",
-       "Register a skill-hub plugin.", operations=(OP_CREATE,)),
+       "Register a skill-hub plugin (source is an object, e.g. "
+       "{'source': 'github', 'repo': 'org/repo'}).", operations=(OP_CREATE,)),
+    # Without a delete path a plugin registered over MCP can only be removed
+    # out-of-band with the master key; disable_plugin is not a substitute
+    # because a disabled plugin still owns its name.
+    _t("litellm_delete_plugin", _P, "DELETE",
+       "/claude-code/plugins/{plugin_name}",
+       "[DESTRUCTIVE] Remove a registered skill-hub plugin by name.",
+       operations=(OP_DELETE,), dangerous=True),
     _t("litellm_enable_plugin", _P, "POST",
        "/claude-code/plugins/{plugin_name}/enable",
        "Enable a registered skill-hub plugin.", operations=(OP_UPDATE,)),

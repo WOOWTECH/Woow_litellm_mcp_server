@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-/* LiteLLM brand palette — indigo/violet, to distinguish from the EMQX green. */
+/* LiteLLM brand palette — indigo/violet. */
 @theme {
   --color-brand-50: #eef2ff;
   --color-brand-100: #e0e7ff;

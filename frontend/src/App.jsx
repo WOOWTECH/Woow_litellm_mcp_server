@@ -2,6 +2,7 @@ import React from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { getToken } from './api';
 import Sidebar from './components/Sidebar';
+import ErrorBoundary from './components/ErrorBoundary';
 import Dashboard from './pages/Dashboard';
 import ToolManager from './pages/ToolManager';
 import ConnectionConfig from './pages/ConnectionConfig';
@@ -36,25 +37,32 @@ export default function App() {
 
   if (isLoginPage) {
     return (
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-      </Routes>
+      <ErrorBoundary resetKey={location.pathname}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+        </Routes>
+      </ErrorBoundary>
     );
   }
 
   return (
     <ProtectedRoute>
       <AppLayout>
-        <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/tools" element={<ToolManager />} />
-          <Route path="/config" element={<ConnectionConfig />} />
-          <Route path="/tokens" element={<TokenManager />} />
-          <Route path="/logs" element={<LogViewer />} />
-          <Route path="/permissions" element={<PermissionEditor />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        {/* Load-bearing: without a boundary here a render error in ANY page
+            unmounts the React root and blanks the entire console. Keyed on the
+            path so navigating away clears a stuck page. */}
+        <ErrorBoundary resetKey={location.pathname}>
+          <Routes>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/tools" element={<ToolManager />} />
+            <Route path="/config" element={<ConnectionConfig />} />
+            <Route path="/tokens" element={<TokenManager />} />
+            <Route path="/logs" element={<LogViewer />} />
+            <Route path="/permissions" element={<PermissionEditor />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </ErrorBoundary>
       </AppLayout>
     </ProtectedRoute>
   );

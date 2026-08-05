@@ -4,10 +4,10 @@
 # ==========================================
 # Two-stage build, mirroring the EMQX reference:
 #
-#   stage 1 (node:20)         builds the React/Vite SPA, applies the LiteLLM
-#                             ConnectionConfig override, and rewrites a handful
-#                             of product strings (EMQX -> LiteLLM) so the shared
-#                             frontend renders LiteLLM branding.
+#   stage 1 (node:20)         builds the React/Vite SPA straight from
+#                             frontend/src — no overrides, no build-time string
+#                             rewriting; the sources already carry the LiteLLM
+#                             branding and the LiteLLM connection form.
 #   stage 2 (python:3.12-slim) installs the mcp-admin-core wheel first, then the
 #                             product package with the [admin] extra, copies the
 #                             built SPA into the static dir, and serves the admin
@@ -37,18 +37,12 @@ RUN npm install
 # Bring in the shared SPA sources.
 COPY frontend/ ./
 
-# Apply the LiteLLM-specific ConnectionConfig override (single Bearer secret,
-# no key/secret pair) on top of the shared page before building.
-COPY frontend-overrides/ConnectionConfig.jsx ./src/pages/ConnectionConfig.jsx
-
-# Rewrite residual product strings in the shared SPA so it reads as LiteLLM.
-# Safe, idempotent, and limited to user-visible copy.
-RUN set -eux; \
-    find ./src -type f \( -name '*.jsx' -o -name '*.js' \) -print0 \
-      | xargs -0 sed -i \
-          -e 's/EMQX MCP Admin/LiteLLM MCP Admin/g' \
-          -e 's/EMQX Broker/LiteLLM Gateway/g' \
-          -e 's/\bEMQX\b/LiteLLM/g'
+# NOTE: this stage used to COPY frontend-overrides/ConnectionConfig.jsx over the
+# page source and then `sed` residual EMQX strings out of the shared SPA. Both
+# steps are deliberately gone. The override silently reverted every fix made to
+# frontend/src/pages/ConnectionConfig.jsx — the image shipped the stale copy —
+# and the sed only masked leftover branding that is now correct in the source
+# itself. frontend/src is the single source of truth; do not reintroduce either.
 
 RUN npm run build
 

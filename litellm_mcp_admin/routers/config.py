@@ -55,6 +55,35 @@ class ConnectionSettings(BaseModel):
     restart: bool = Field(True, description="Restart the MCP server after saving.")
 
 
+class ConnectionProbe(BaseModel):
+    """Body of ``POST /api/config/test`` — every field optional, by design.
+
+    This is deliberately NOT :class:`ConnectionSettings`. ``PUT /connection``
+    must keep ``litellm_mcp_base_url`` required, because saving a connection
+    with no URL is a real mistake worth a 422. A *probe* is the opposite case:
+    "test what is currently saved" is a legitimate, and in fact the most common,
+    request — the SPA fires it on a freshly loaded page, and any client sending
+    ``{}`` or no body at all means exactly that. Binding the probe to the
+    required-field model turned that into ``422 Field required``, i.e. the
+    endpoint documented a saved-values fallback that no caller could reach.
+
+    ``litellm_mcp_base_url`` defaults to ``None`` rather than ``""`` so that
+    "not supplied" and "supplied as empty" stay distinguishable: the first
+    means fall back to the stored URL, the second means the operator cleared
+    the field and must be told the URL is missing, not shown a green banner
+    describing a gateway they are no longer pointing at.
+    """
+
+    litellm_mcp_base_url: str | None = Field(
+        default=None,
+        description="URL to probe. Omit to probe the saved connection.",
+    )
+    litellm_mcp_master_key: str = Field(
+        default="",
+        description="Key to probe with. Blank falls back to the saved key.",
+    )
+
+
 class PermissionPolicy(BaseModel):
     """What the PermissionEditor page saves."""
 
@@ -188,27 +217,37 @@ async def put_connection(payload: ConnectionSettings) -> dict[str, Any]:
 
 
 @router.post("/test")
-async def test_connection(payload: ConnectionSettings | None = None) -> dict[str, Any]:
+async def test_connection(payload: ConnectionProbe | None = None) -> dict[str, Any]:
     """Verify credentials against LiteLLM — the posted ones, or the saved ones.
 
-    ConnectionConfig.jsx calls this with no body, so saved values are the
-    normal path.
+    Three call shapes, all valid:
+
+    * no body, or ``{}`` — probe the saved connection. This is what a client
+      that just wants "is the gateway I am configured against alive?" sends,
+      and it must not be a 422 (see :class:`ConnectionProbe`).
+    * ``{"litellm_mcp_base_url": "..."}`` — probe that URL with the saved key,
+      so ConnectionConfig.jsx's "leave the key blank to keep the stored one"
+      still tests the real credential rather than an empty Bearer.
+    * both fields — probe exactly what was posted, before saving it.
+
+    A base URL that was *supplied but empty* is honoured as an empty URL, not
+    silently swapped for the stored one: the operator has cleared the field, and
+    answering "Connected" about the URL they just deleted is the misleading kind
+    of success this endpoint exists to prevent.
     """
-    if payload is not None and payload.litellm_mcp_base_url:
-        master_key = payload.litellm_mcp_master_key
-        if not master_key:
-            from mcp_admin_core.config import get_config_store
-
-            saved = await get_config_store().get("connection", {}) or {}
-            master_key = saved.get("litellm_mcp_master_key", "")
-        return await _probe(payload.litellm_mcp_base_url, master_key)
-
     from mcp_admin_core.config import get_config_store
 
-    connection = await get_config_store().get("connection", {}) or {}
+    saved = await get_config_store().get("connection", {}) or {}
+
+    if payload is None or "litellm_mcp_base_url" not in payload.model_fields_set:
+        return await _probe(
+            saved.get("litellm_mcp_base_url", ""),
+            saved.get("litellm_mcp_master_key", ""),
+        )
+
     return await _probe(
-        connection.get("litellm_mcp_base_url", ""),
-        connection.get("litellm_mcp_master_key", ""),
+        payload.litellm_mcp_base_url or "",
+        payload.litellm_mcp_master_key or saved.get("litellm_mcp_master_key", ""),
     )
 
 

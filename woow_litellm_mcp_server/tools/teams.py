@@ -8,6 +8,7 @@ from fastmcp import Context
 
 from ..deps import litellm_client
 from ..gating import ToolGate
+from ..registry import OP_CREATE, OP_DELETE, OP_UPDATE
 from ._common import destructive, prune_none, read_only, writing
 
 
@@ -29,6 +30,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
             organization_id: str | None = None,
         ) -> dict:
             """Create a team."""
+            gate.require_operation("litellm_create_team", OP_CREATE)
             body = prune_none(
                 {
                     "team_alias": team_alias,
@@ -51,16 +53,23 @@ def register(mcp: Any, gate: ToolGate) -> None:
         async def litellm_list_teams(
             ctx: Context,
             page: int = 1,
-            size: int = 50,
+            page_size: int = 50,
             team_alias: str | None = None,
             user_id: str | None = None,
             organization_id: str | None = None,
         ) -> dict:
-            """List/paginate teams."""
+            """List/paginate teams.
+
+            ``page_size`` matches ``litellm_list_users``; the wire name
+            /v2/team/list expects is ``page_size`` too. Sending ``size`` (the
+            old spelling) made FastAPI ignore it and silently fall back to 10
+            results, so an agent enumerating teams saw only the first page and
+            concluded the rest did not exist.
+            """
             params = prune_none(
                 {
                     "page": page,
-                    "size": size,
+                    "page_size": page_size,
                     "team_alias": team_alias,
                     "user_id": user_id,
                     "organization_id": organization_id,
@@ -96,6 +105,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
             rpm_limit: int | None = None,
         ) -> dict:
             """Update team tunables by team_id."""
+            gate.require_operation("litellm_update_team", OP_UPDATE)
             body = prune_none(
                 {
                     "team_id": team_id,
@@ -119,6 +129,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
 
             Removes the teams and their membership associations permanently.
             """
+            gate.require_operation("litellm_delete_team", OP_DELETE)
             return await litellm_client(ctx).post(
                 "/team/delete", json_data={"team_ids": team_ids}
             )
@@ -142,6 +153,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
             Identify the member by ``user_id`` or ``user_email``; ``role`` is
             typically ``"user"`` or ``"admin"``.
             """
+            gate.require_operation("litellm_team_member_add", OP_CREATE)
             member = prune_none(
                 {
                     "user_id": user_id,
@@ -176,6 +188,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
 
             Identify the member by ``user_id`` or ``user_email``.
             """
+            gate.require_operation("litellm_team_member_delete", OP_DELETE)
             body = prune_none(
                 {
                     "team_id": team_id,

@@ -8,6 +8,7 @@ from fastmcp import Context
 
 from ..deps import litellm_client
 from ..gating import ToolGate
+from ..registry import OP_CREATE, OP_DELETE, OP_UPDATE
 from ._common import destructive, prune_none, read_only, writing
 
 
@@ -22,6 +23,7 @@ def register(mcp: Any, gate: ToolGate) -> None:
             ctx: Context,
             user_email: str | None = None,
             user_id: str | None = None,
+            user_alias: str | None = None,
             user_role: str | None = None,
             teams: list[str] | None = None,
             models: list[str] | None = None,
@@ -31,12 +33,18 @@ def register(mcp: Any, gate: ToolGate) -> None:
             """Create an internal user.
 
             ``user_role`` is one of LiteLLM's roles (e.g. ``internal_user``,
-            ``proxy_admin``). When ``auto_create_key`` is true a key is minted.
+            ``proxy_admin``). ``user_alias`` is the human-readable display name.
+            When ``auto_create_key`` is true a key is minted.
+
+            ``teams`` IS honoured here (NewUserRequest accepts it) — unlike on
+            ``litellm_update_user``, where LiteLLM has no such field.
             """
+            gate.require_operation("litellm_create_user", OP_CREATE)
             body = prune_none(
                 {
                     "user_email": user_email,
                     "user_id": user_id,
+                    "user_alias": user_alias,
                     "user_role": user_role,
                     "teams": teams,
                     "models": models,
@@ -58,14 +66,28 @@ def register(mcp: Any, gate: ToolGate) -> None:
             page_size: int = 50,
             role: str | None = None,
             user_ids: list[str] | None = None,
+            user_email: str | None = None,
+            team: str | None = None,
+            sort_by: str | None = None,
+            sort_order: str | None = None,
         ) -> dict:
-            """List/paginate users."""
+            """List/paginate users.
+
+            Push filtering down to the gateway rather than paging the whole
+            directory: ``user_email`` finds one user, ``team`` lists a team's
+            members. ``sort_by`` names a column (e.g. ``spend``) and
+            ``sort_order`` is ``asc``/``desc``.
+            """
             params = prune_none(
                 {
                     "page": page,
                     "page_size": page_size,
                     "role": role,
                     "user_ids": ",".join(user_ids) if user_ids else None,
+                    "user_email": user_email,
+                    "team": team,
+                    "sort_by": sort_by,
+                    "sort_order": sort_order,
                 }
             )
             return await litellm_client(ctx).get("/user/list", params=params)
@@ -92,18 +114,31 @@ def register(mcp: Any, gate: ToolGate) -> None:
             ctx: Context,
             user_id: str,
             user_role: str | None = None,
+            user_alias: str | None = None,
+            user_email: str | None = None,
             max_budget: float | None = None,
-            teams: list[str] | None = None,
             models: list[str] | None = None,
+            team_id: str | None = None,
         ) -> dict:
-            """Update user role/budget/teams/models."""
+            """Update a user's role, alias, email, budget or models.
+
+            To change TEAM MEMBERSHIP use ``litellm_team_member_add`` /
+            ``litellm_team_member_delete``. LiteLLM's UpdateUserRequest has no
+            ``teams`` field, so the ``teams`` argument this tool used to accept
+            was silently discarded by pydantic and the call reported success
+            while changing nothing. ``team_id`` (the single-team field
+            UpdateUserRequest really has) is exposed instead.
+            """
+            gate.require_operation("litellm_update_user", OP_UPDATE)
             body = prune_none(
                 {
                     "user_id": user_id,
                     "user_role": user_role,
+                    "user_alias": user_alias,
+                    "user_email": user_email,
                     "max_budget": max_budget,
-                    "teams": teams,
                     "models": models,
+                    "team_id": team_id,
                 }
             )
             return await litellm_client(ctx).post("/user/update", json_data=body)
@@ -117,8 +152,18 @@ def register(mcp: Any, gate: ToolGate) -> None:
         async def litellm_delete_user(ctx: Context, user_ids: list[str]) -> dict:
             """[DESTRUCTIVE] Delete users by ``user_ids[]``.
 
-            Also removes the users' keys; the action is irreversible.
+            Also removes the users' keys; the action is irreversible. Returns
+            ``{"deleted": <rows>, "user_ids": [...]}``.
             """
-            return await litellm_client(ctx).post(
+            gate.require_operation("litellm_delete_user", OP_DELETE)
+            result = await litellm_client(ctx).post(
                 "/user/delete", json_data={"user_ids": user_ids}
             )
+            # /user/delete answers with the BARE integer 1 (rows deleted), not
+            # an object. Returning it straight through failed FastMCP's
+            # `-> dict` output-schema validation, which turned a completed,
+            # irreversible deletion into "Error calling tool
+            # 'litellm_delete_user'" — the caller was told the users survived
+            # while they and their keys were already gone. Wrap it so the
+            # declared shape is honest.
+            return {"deleted": result, "user_ids": user_ids}

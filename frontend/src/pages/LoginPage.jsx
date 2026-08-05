@@ -1,13 +1,20 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { KeyRound, AlertCircle, Loader2 } from 'lucide-react';
-import { setToken } from '../api';
+import { setToken, getToken, formatApiError } from '../api';
 
 export default function LoginPage() {
   const navigate = useNavigate();
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+
+  // A visitor who still holds a valid (non-expired) token has no business on
+  // this form — landing here and typing a password again was the visible half
+  // of the /login -> / -> /login bounce.
+  useEffect(() => {
+    if (getToken()) navigate('/', { replace: true });
+  }, [navigate]);
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -18,15 +25,23 @@ export default function LoginPage() {
       const response = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // The login response sets the httpOnly cookie the SSE log stream
+        // authenticates with; without this it may never be stored.
+        credentials: 'same-origin',
         body: JSON.stringify({ password }),
       });
 
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail || 'Invalid password');
+        // FastAPI's 422 `detail` is an ARRAY of error objects, so the old
+        // `body.detail || …` put "[object Object]" in the banner. One shared
+        // formatter keeps every page's error text readable.
+        throw new Error(formatApiError(body, 'Invalid password'));
       }
 
       const data = await response.json();
+      // Throws if the response carried no token, instead of persisting the
+      // literal string "undefined" as a session that can never be cleared.
       setToken(data.token || data.access_token);
       navigate('/', { replace: true });
     } catch (err) {

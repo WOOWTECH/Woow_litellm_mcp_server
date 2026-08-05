@@ -108,12 +108,13 @@ spec:
             - -c
             - |
               set -x
-              cp /repo/frontend-overrides/ConnectionConfig.jsx src/pages/ConnectionConfig.jsx || true
-              find ./src -type f \( -name '*.jsx' -o -name '*.js' \) -print0 \
-                | xargs -0 sed -i \
-                    -e 's/EMQX MCP Admin/LiteLLM MCP Admin/g' \
-                    -e 's/EMQX Broker/LiteLLM Gateway/g' \
-                    -e 's/\bEMQX\b/LiteLLM/g' || true
+              # This step used to `cp frontend-overrides/ConnectionConfig.jsx` over
+              # the page source and `sed` residual EMQX strings out of the shared
+              # SPA. Both are gone on purpose: the override silently reverted every
+              # fix made to frontend/src/pages/ConnectionConfig.jsx (the running pod
+              # shipped the stale copy), and the sed only masked leftover branding
+              # that is now correct in the source itself. Do NOT reintroduce either —
+              # frontend/src is the single source of truth for the console.
               npm install --no-audit --no-fund && npm run build \
                 && mkdir -p /repo/static && cp -r dist/* /repo/static/ \
                 || echo "SPA build failed - admin API + proxy will still run"

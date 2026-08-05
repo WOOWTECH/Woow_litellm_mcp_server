@@ -110,8 +110,8 @@ not disturbed), both Secrets present. OPEN-5 is closed by this.
 
 ## FINDING-004 — `seed-config` reverts console-side password and token changes
 
-**Severity:** high · **Status:** FIXED in the manifest; live Deployment still carries the
-old script until re-applied
+**Severity:** high · **Status:** FIXED — in the manifest and, since 5 August 2026, on the
+live Deployment object as well
 
 The `seed-config` init container was documented — and described in BUG-2 below — as
 idempotent, seeding `/data/config.json` only when absent. The live script does not do
@@ -154,15 +154,51 @@ on the next restart. The comment block in the manifest states this so the next p
 does not "simplify" the two forms back into one. `docs/deployment.md` documents the
 three-way split and both procedures were rewritten accordingly. OPEN-6 is closed.
 
-**Residual risk — read this before assuming it is done.** Editing the manifest does not
-change the running object. `Deployment/litellm-mcp-admin` in the cluster still embeds the
-old unconditional script and will keep reverting console-side changes until someone
-`kubectl apply -f k8s-admin-deploy.yaml`. That apply is **not** free: `strategy: Recreate`
-means the old pod terminates before the new one starts, and cold start is 2.5–3 minutes,
-so the console and the public MCP endpoint are down for that window. It was deliberately
-not performed as part of this pass. Until it is, keep updating
-`Secret/litellm-mcp-admin-secret` by hand alongside any console-side password or token
-change.
+**Landing it on the cluster (5 August 2026).** Editing the manifest does not change the
+running object, so the fix was only half done until the Deployment was re-applied. That
+was carried out deliberately, not blind, because two hazards sit in the way.
+
+The first is the manifest itself. `k8s-admin-deploy.yaml` ships four documents and the
+first is `Secret/litellm-mcp-admin-secret` carrying **placeholder** credentials. A plain
+`kubectl apply -f k8s-admin-deploy.yaml` would therefore overwrite the live admin
+password, JWT secret and proxy token with placeholder strings and lock everyone out of
+the console at the same moment the pod restarts. **Only the `Deployment` document may be
+applied to this cluster.** It was extracted into a standalone file, diffed against the
+running object, and applied on its own.
+
+The second is the interaction between the fix and the Secret. With `setdefault` in place
+the pod now prefers `/data`, so a Secret that had drifted from the PVC would have been
+ignored — but with the *old* script still running at the moment of the apply, the pod
+would first have been rebuilt from the Secret. If the two had disagreed, the restart
+would have flipped the live `mcp_auth_token` and killed the connected client. They were
+proved equal beforehand by comparing sha256 digests only — an ephemeral pod mounted both
+Secrets and printed 12-character digests and lengths, never values — and all four
+matched, so the restart could not change anything.
+
+Sequence actually performed: back up `/data/config.json` to
+`/data/config.json.pre-open7-20260805.bak`; confirm Secret and PVC agree by digest; diff
+the live Deployment against the manifest (verdict: the two `setdefault` lines and the
+comment block, nothing else); apply the single Deployment document with field manager
+`kubernetes-mcp-server`, the same manager that created the object, so server-side apply
+raised no ownership conflict.
+
+**Outcome.** Pod `…-749b47fb6c-zm9zg` terminated, `…-59758cc76c-6hqbj` came up `1/1`
+with **0 restarts** in roughly four minutes — consistent with the 2.5–3 minute cold-start
+estimate plus scheduling. `/data/config.json` came out byte-identical to the backup
+(sha256 prefix `266e6eab84873668`, 1044 bytes, mode `0600`): password, token, master key,
+the four `LITELLM_MCP_*` gating switches and `token_history` all preserved. The full
+public chain — Cloudflare → console → loopback child → LiteLLM — was re-verified with
+`litellm_health_readiness`, which returned `healthy` against gateway 1.83.14.
+
+**Regression test.** The claim that matters is behavioural, not textual, so the *deployed*
+seed script was extracted from the running object and executed against synthetic configs
+in a sandbox. It asserts: first boot seeds both credentials from the Secret; a restart
+after a GUI-side password change and a GUI-side token rotation leaves both GUI values
+intact; `connection` is still refreshed from the Secret on every restart; the child's
+gating env, `token_history` and the legacy `tools.disabled` → `disabled_tools` migration
+all behave. All assertions passed. The manual workaround — updating
+`Secret/litellm-mcp-admin-secret` by hand alongside every console-side change — is no
+longer required.
 
 **Note on BUG-2.** The historical entry below claims the fix was "seeds only when the
 file is absent". That is not what shipped. The shipped fix was narrower: preserve
@@ -290,7 +326,8 @@ overwrote `/data/config.json` wholesale on every start, resetting the tool gates
 *Corrected description:* the fix was **not** "seed only when the file is absent". The
 container still runs on every start and still rewrites `admin_password`,
 `mcp_auth_token` and `connection` unconditionally — see FINDING-004 above, which is the
-part of this bug that was never actually fixed.
+part of this bug that went unfixed until August 2026. `admin_password` and
+`mcp_auth_token` are now `setdefault`; `connection` remains unconditional by design.
 
 **BUG-3 — `RollingUpdate` deadlocked on the `ReadWriteOnce` PVC.** The new pod could
 not mount the volume while the old pod held it, so rollouts hung until timeout. Fixed by
@@ -316,8 +353,12 @@ resolves dependencies fresh on every cold start, so two deploys of the same comm
 produce different SPA bundles. Deliberately deferred from this documentation pass;
 worth a separate commit.
 
-**OPEN-3 — Stale backup on the config PVC.** `/data/config.json.prefix-redeploy.bak`
-remains from an earlier migration. Harmless but untracked; delete when convenient.
+**OPEN-3 — Stale backups on the config PVC.** Two now:
+`/data/config.json.prefix-redeploy.bak` from an earlier migration, and
+`/data/config.json.pre-open7-20260805.bak` taken immediately before the OPEN-7 re-apply.
+The second is worth keeping until the fixed seed script has survived a few unattended
+restarts; both are harmless but untracked, and each is a full copy of the config
+including credentials, so they inherit its `0600` sensitivity. Delete when convenient.
 
 **OPEN-4 — Credential rotation.** Two credentials were shared with a third-party
 browser automation service to complete this work and should be rotated: the GitHub
@@ -330,18 +371,25 @@ would make every encrypted database column undecryptable.
 deleted. `k8s-deploy.yaml` was removed from the repository and the live Deployment and
 `Service/litellm-mcp` were deleted from the cluster. See FINDING-003.
 
-**OPEN-6 — ~~Make `seed-config` seed rather than overwrite.~~ CLOSED in the manifest.**
+**OPEN-6 — ~~Make `seed-config` seed rather than overwrite.~~ CLOSED.**
 `admin_password` and `mcp_auth_token` now use `setdefault`; `connection` stays an
-assignment on purpose. See FINDING-004. **The follow-up is not closed:** the running
-Deployment object still embeds the old script and reverts console-side changes until
-`k8s-admin-deploy.yaml` is re-applied, which under `strategy: Recreate` means a 2.5–3
-minute console outage. Schedule it; do not apply it blind.
+assignment on purpose. See FINDING-004. The follow-up that kept this open — the running
+Deployment still embedding the old script — was closed by OPEN-7 below.
 
-**OPEN-7 — Re-apply `k8s-admin-deploy.yaml` to land the FINDING-004 fix.** The one
-outstanding action from this pass. It also picks up the rewritten header comments. Plan
-for downtime, and update `Secret/litellm-mcp-admin-secret` to the *current* console
-password and token before applying, since the pre-fix pod may have reverted them
-already — check `/data/config.json` against the Secret first.
+**OPEN-7 — ~~Re-apply `k8s-admin-deploy.yaml` to land the FINDING-004 fix.~~ CLOSED.**
+Done 5 August 2026. Only the `Deployment` document was applied, never the whole file:
+the `Secret` document in that manifest holds placeholders and applying it would have
+overwritten the live credentials. The Secret and the PVC were proved to agree by sha256
+digest first, so the `Recreate` restart could not flip the live `mcp_auth_token`, and
+`/data/config.json` was backed up before the apply. New pod reached `1/1` with 0 restarts
+in about four minutes; the config came out byte-identical and the deployed seed script
+passed a behavioural regression test. Full write-up under FINDING-004.
+
+**A general rule this left behind.** `k8s-admin-deploy.yaml` is a bootstrap manifest, not
+a reconciliation target. Its first document seeds credentials with placeholders, so
+`kubectl apply -f k8s-admin-deploy.yaml` against a *live* cluster is destructive: it
+resets the admin password, JWT secret and proxy token to placeholder strings. Apply the
+whole file only on first install; afterwards apply the `Deployment` document alone.
 
 ---
 
@@ -364,3 +412,5 @@ Statements a reviewer can check independently.
 | The tunnel's origin is the admin Service | `kubectl logs -n litellm deploy/cloudflared --tail=200 \| grep originService` — grep `originService`, **not** `dest=`; the latter prints the live token (FINDING-006) |
 | The repository ships exactly two manifests | `ls k8s-*.yaml` → `k8s-base.yaml`, `k8s-admin-deploy.yaml` |
 | `k8s-base.yaml` contains no workload | `python -c "import yaml,sys;print([(d['kind'],d['metadata']['name']) for d in yaml.safe_load_all(open('k8s-base.yaml')) if d])"` → `Namespace`, `Secret` only |
+| The live Deployment carries the FINDING-004 fix | `kubectl get deploy litellm-mcp-admin -n litellm-mcp -o jsonpath='{.spec.template.spec.initContainers[2].command[2]}' \| grep setdefault` — expect `setdefault` on both `admin_password` and `mcp_auth_token` |
+| The fix does not clobber GUI-side changes | Extract that same script and run it over a synthetic `/data/config.json` whose password and token differ from the env vars; both must survive, `connection` must not |

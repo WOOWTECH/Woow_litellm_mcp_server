@@ -95,10 +95,10 @@ kills the old URL instantly. The token lives in the path rather than a query str
 deliberately — uvicorn logs full request lines, and a query-string secret would end up
 in every access log entry.
 
-**Registryless Kubernetes deployment.** `k8s-deploy.yaml` and
-`k8s-admin-deploy.yaml` use `initContainers` (`alpine/git` to clone, `node:20-alpine`
-to build the SPA, `python:3.12-slim` to seed the config PVC) so the cluster pulls only
-public upstream images. Cold start is about two and a half to three minutes; the SPA
+**Registryless Kubernetes deployment.** `k8s-admin-deploy.yaml` uses three
+`initContainers` (`alpine/git` to clone, `node:20-alpine` to build the SPA,
+`python:3.12-slim` to seed the config PVC) so the cluster pulls only public upstream
+images. Cold start is about two and a half to three minutes; the SPA
 build step ends in `exit 0` by design so a frontend build failure degrades the console
 rather than crash-looping the pod.
 
@@ -116,7 +116,7 @@ The suite is one container running one uvicorn process that fronts three things:
 admin API, the SPA, and a reverse proxy to a loopback-bound MCP child.
 
 ```
-                       ┌───────────────────────── single container ───────────────────────────┐
+                       ┌──────────────────────── single container ──────────────────────┐
   Claude / MCP client  │                                                                      │
         │              │  uvicorn  litellm_mcp_admin.main:app   (0.0.0.0:8080)                │
         │  HTTPS       │    ├─ AuthMiddleware (JWT)  ── /api/*  admin GUI + API               │
@@ -125,7 +125,7 @@ admin API, the SPA, and a reverse proxy to a loopback-bound MCP child.
                        │                                       ▼                              │
                        │             McpProcessManager ► woow_litellm_mcp_server (127.0.0.1)  │
                        │                                       │  transport=http  /mcp/       │
-                       └───────────────────────────────────────┼──────────────────────────────┘
+                       └────────────────────────────────────┼──────────────────────────┘
                                                                ▼
                                         LiteLLM gateway  (Bearer master key, port 4000)
 ```
@@ -200,7 +200,7 @@ can reject it.
     │                  │                 │                   │                │ route ───────►│
     │                  │                 │                   │                │◄── completion │
     │                  │                 │                   │◄── JSON        │               │
-    │◄──────────────── structured MCP result ────────────────│                │               │
+    │◄──────────────── structured MCP result ────────────│                │               │
 ```
 
 ```mermaid
@@ -317,7 +317,7 @@ single value because a few tools legitimately span two verbs.
 Two namespaces, two deployments, one shared cluster DNS name between them.
 
 ```
-  ┌── namespace: litellm ─────────────┐   ┌── namespace: litellm-mcp ──────────────────┐
+  ┌── namespace: litellm ────────────┐   ┌── namespace: litellm-mcp ──────────────┐
   │                                   │   │                                            │
   │  Deployment  litellm              │   │  Deployment  litellm-mcp-admin             │
   │   image ghcr.io/berriai/litellm   │   │   strategy: Recreate                       │
@@ -326,7 +326,7 @@ Two namespaces, two deployments, one shared cluster DNS name between them.
   │  Service  litellm  :4000  ◄───────┼───┼──   └─ init  seed-config   python:3.12-slim│
   │                                   │   │   └─ main  admin           :8080           │
   │  Secret   master key, salt key    │   │  PVC  litellm-mcp-data → /data/config.json │
-  └───────────────────────────────────┘   └────────────────────────────────────────────┘
+  └───────────────────────────────┘   └──────────────────────────────────────────┘
                   ▲                                          ▲
                   │ Cloudflare tunnel                        │ Cloudflare tunnel
            litellm.woowtech.io                       litellm-mcp.woowtech.io
@@ -397,8 +397,9 @@ adds the console.
 
 Deployment and packaging artefacts also live at the root: `Dockerfile` (two-stage,
 `node:20-alpine` → `python:3.12-slim`, `EXPOSE 8080`), `docker-compose.yml`,
-`k8s-deploy.yaml`, `k8s-admin-deploy.yaml`, `k8s-secret.example.yaml`, `pyproject.toml`,
-`mcp_admin_core.pyproject.toml`, `pytest.ini` and `.env.example`.
+`k8s-base.yaml` (namespace + gateway secret, no workload), `k8s-admin-deploy.yaml` (the
+whole console stack), `pyproject.toml`, `mcp_admin_core.pyproject.toml`, `pytest.ini` and
+`.env.example`.
 
 The Python packages total **7,206 lines**; the frontend adds **3,507 lines** of JSX and
 JS.
@@ -578,10 +579,16 @@ count.
 
 ## Installation
 
-### Option 1 — bare MCP server
+There is **one** deployed shape: the admin console, which spawns the MCP server as a
+loopback child process and publishes it through the token-gated proxy. Everything below
+is either that shape or a local-development convenience.
 
-The smallest useful deployment: no console, no proxy, just the 40 tools over stdio or
-Streamable-HTTP.
+### Option 1 — bare MCP server, local development only
+
+The smallest way to exercise the tools: no console, no proxy, just the 40 tools over
+stdio or Streamable-HTTP. **This is not a deployment path.** Nothing authenticates the
+HTTP interface, so bind it to loopback unless you know precisely who can reach the
+address you bind instead.
 
 ```bash
 git clone https://github.com/WOOWTECH/Woow_litellm_mcp_server.git
@@ -591,9 +598,9 @@ pip install .
 export LITELLM_MCP_BASE_URL=http://localhost:4000
 export LITELLM_MCP_MASTER_KEY=sk-...        # never commit this
 
-# Streamable-HTTP (the deployed default)
+# Streamable-HTTP, loopback
 python -m woow_litellm_mcp_server.server \
-  --transport http --host 0.0.0.0 --port 8000 --path /mcp/
+  --transport http --host 127.0.0.1 --port 8000 --path /mcp/
 
 # or stdio, for a local MCP client
 python -m woow_litellm_mcp_server.server --transport stdio
@@ -611,29 +618,20 @@ The two-stage `Dockerfile` builds the SPA on `node:20-alpine`, then runs
 `admin_password` from the config store (default `admin` — change it on first login),
 point the Connection page at your gateway, and toggle tools on the Tools page.
 
-### Option 3 — Kubernetes, bare server
+### Option 3 — Kubernetes: console + encrypted proxy + MCP child
 
-No image build and no private registry: an `initContainer` clones this public repo into
-an `emptyDir` and the main container `pip install`s it.
-
-```bash
-kubectl apply -f k8s-secret.example.yaml   # after filling in the real master key
-kubectl apply -f k8s-deploy.yaml
-```
-
-In-cluster consumers then reach it at
-`http://litellm-mcp.litellm-mcp.svc.cluster.local:8000/mcp/`.
-
-### Option 4 — Kubernetes, console + encrypted proxy
-
-`k8s-deploy.yaml` alone gives a bare, unauthenticated MCP server that is safe only
-because it never leaves the cluster. To publish it, apply the admin manifest too — same
-git-clone trick, plus the SPA build and a seeded config PVC.
+The supported production deployment. No image build and no private registry: init
+containers clone this public repo into an `emptyDir`, build the SPA and seed the config
+PVC, and the main container `pip install`s `.[admin]` and serves the console on `:8080`.
 
 ```bash
-kubectl apply -f k8s-deploy.yaml         # namespace + litellm-mcp-secret
-kubectl apply -f k8s-admin-deploy.yaml   # console + encrypted proxy + MCP child
+kubectl apply -f k8s-base.yaml           # namespace + litellm-mcp-secret
+kubectl apply -f k8s-admin-deploy.yaml   # console + encrypted proxy + MCP child + PVC
 ```
+
+`k8s-base.yaml` ships placeholder secrets; replace them before or immediately after
+applying, and on a cluster that already holds real values, skip that file entirely rather
+than overwriting a live master key with `sk-REPLACE_ME`.
 
 Point a Cloudflare tunnel or any ingress at
 `http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080`. The only public MCP door
@@ -642,6 +640,21 @@ Cloudflare Bot Fight Mode caveat are in
 [`docs/encrypted-proxy.md`](./docs/encrypted-proxy.md).
 
 Expect a two-and-a-half to three minute cold start while the three init containers run.
+
+> **Upgrading from an earlier revision?** The repository used to ship a second manifest,
+> `k8s-deploy.yaml`, that ran the server bare on `0.0.0.0:8000` behind `Service/litellm-mcp`
+> with no authentication — and because that file also carried the shared namespace and
+> secret, the documented apply order produced the ungated endpoint whether you wanted it
+> or not. It has been removed (FINDING-003 in [`findings.md`](./findings.md)). Clean up an
+> existing cluster with:
+>
+> ```bash
+> kubectl delete deployment litellm-mcp-server -n litellm-mcp
+> kubectl delete service    litellm-mcp        -n litellm-mcp
+> # Keep the namespace and Secret/litellm-mcp-secret — the console needs both.
+> ```
+>
+> Nothing is lost: the console never dialled `litellm-mcp:8000`.
 
 ### Connecting an MCP client
 
@@ -702,8 +715,9 @@ more than the marketing word.
 
 **Secrets never enter the repository.** The LiteLLM master key, the salt key and the
 admin password live in Kubernetes Secrets and the container environment only.
-`k8s-secret.example.yaml` ships placeholders. Every config API response masks secret
-fields, and the master key is write-only — settable, never readable.
+`k8s-base.yaml` and `k8s-admin-deploy.yaml` ship placeholders only. Every config API
+response masks secret fields, and the master key is write-only — settable, never
+readable.
 
 **`LITELLM_SALT_KEY` must be set once and never rotated.** LiteLLM uses it to encrypt
 columns in its database; rotating it renders every previously encrypted value

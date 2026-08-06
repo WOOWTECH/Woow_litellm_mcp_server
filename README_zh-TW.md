@@ -595,6 +595,15 @@ Cloudflare Bot Fight Mode 注意事項，都寫在
 
 三個 init container 執行期間，冷啟動約需兩分半到三分鐘。
 
+上面兩行指令是給**全新叢集**用的。`k8s-admin-deploy.yaml` 是「初次安裝」用的 manifest，
+不是可以反覆套用的收斂目標：它的第一份文件會用佔位值建立
+`Secret/litellm-mcp-admin-secret`，所以對正在運行的叢集整份重新套用，會把管理密碼、JWT
+祕密與代理 token 全部重設成 `REPLACE_ME…`，讓你登不進主控台，同時打斷所有已連線的用戶端。
+要升級線上部署，請只套用其中的 `Deployment` 那份文件，步驟見
+[`docs/deployment.md`](./docs/deployment.md#re-applying-to-a-running-cluster)。如果只是要
+更新 `main` 上的程式碼，根本不需要 apply —— `/repo` 每次啟動都會重新 clone，執行
+`kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp` 就夠了。
+
 > **從舊版本升級？** 這個儲存庫過去還有第二份 manifest `k8s-deploy.yaml`，會把同一支伺服器
 > 裸跑在 `0.0.0.0:8000`、掛在 `Service/litellm-mcp` 後面，前面沒有任何驗證；而因為那個檔案
 > 同時帶著共用的 namespace 與 secret，照著文件的套用順序做，無論你要不要都會得到那個沒有

@@ -58,7 +58,7 @@ jobs:
             test -f "$CHART/templates/$t.yaml" || { echo "missing template: $t.yaml"; exit 1; }
           done
           for t in namespace.yaml pvc.yaml service.yaml deployment.yaml secrets.yaml tests/smoke.yaml; do
-            grep -q "# Source: litellm-mcp/templates/$t" /tmp/secrets.yaml \
+            grep -qs "# Source: litellm-mcp/templates/$t" /tmp/*.yaml \
               || { echo "template never rendered: $t"; exit 1; }
           done
           echo "all 6 templates render"

@@ -1,0 +1,93 @@
+# Default values for the litellm-mcp chart.
+# The defaults reproduce the woow-k3s deployment 1:1 (namespace litellm-mcp,
+# Longhorn storage, the git-clone/npm-build/pip-install runtime model), so
+# `helm template` with no values equals what is running today.
+
+namespace:
+  # Render the Namespace object. A namespace equal to the release namespace
+  # (`-n`) is never rendered - create it with --create-namespace instead - so
+  # `helm uninstall` can never delete the namespace the release lives in.
+  # On woow-k3s the release lives in `litellm` and this chart owns the
+  # `litellm-mcp` Namespace, exactly as the litellm chart did before the split.
+  create: true
+  name: litellm-mcp
+
+# Add `helm.sh/resource-policy: keep` to the Namespace, the PVC and every
+# chart-created Secret, so `helm uninstall` never deletes /data/config.json
+# (admin password, MCP token, tool toggles) or the seed credentials.
+keepOnUninstall: true
+
+# Default StorageClass for the data PVC. Longhorn "longhorn" uses reclaimPolicy Retain.
+storageClassName: longhorn
+
+secrets:
+  # false (default): the Secrets already exist (created from
+  #   examples/secrets.example.yaml) and the chart never renders them, so a
+  #   `helm upgrade` can never overwrite a rotated token with an empty value.
+  # true: render both Secrets from the values below (fresh installs, tests).
+  #   Every value is required() - there are no defaults to leak.
+  create: false
+  # litellm-mcp-secret: the upstream gateway. Re-read on every pod start.
+  litellmBaseUrl: ""
+  litellmMasterKey: ""
+  # litellm-mcp-admin-secret: first-boot seeds for the console's own
+  # credentials. After the first boot /data/config.json is the source of truth.
+  adminPassword: ""
+  mcpAuthToken: ""
+  jwtSecret: ""
+
+# Names of the existing Secrets the Deployment reads. Only change these when
+# running a second instance beside the first one in the same namespace.
+existingSecrets:
+  # keys: LITELLM_BASE_URL, LITELLM_MASTER_KEY (JWT_SECRET is also present live)
+  connection: litellm-mcp-secret
+  # keys: ADMIN_PASSWORD, MCP_AUTH_TOKEN, JWT_SECRET
+  admin: litellm-mcp-admin-secret
+
+admin:
+  # The console is built on start from gitRepo - there is no published image.
+  # Pinning is not possible today (the clone follows the default branch); see
+  # README "Runtime model" before changing this.
+  gitRepo: https://github.com/WOOWTECH/Woow_litellm_mcp_server
+  images:
+    git: alpine/git:latest
+    node: node:20-alpine
+    python: python:3.12-slim
+  # JWT lifetime for a console login, in hours.
+  jwtExpiryHours: 12
+  storage:
+    # "" = use storageClassName
+    className: ""
+    size: 256Mi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# OPT-IN hardening. Every switch below is OFF by default, and "off" means the
+# field is not rendered at all, so the pod template stays byte-identical to what
+# is running. Turning one on rolls the pod - do it deliberately, not as a side
+# effect of an upgrade. See README "Follow-ups".
+hardening:
+  # true renders `automountServiceAccountToken: false`. The pod runs code cloned
+  # from a public repository at start and needs no Kubernetes API access.
+  disableServiceAccountToken: false
+  # true appends `--no-access-log` to uvicorn. The public MCP credential is a
+  # path token, so every access line writes that credential to the pod log in
+  # clear text (audit finding, high severity). It also removes the request lines
+  # the console's Logs page renders, which is why it is not the default.
+  disableUvicornAccessLog: false
+  # Verbatim securityContext blocks, rendered only when non-empty.
+  podSecurityContext: {}
+  containerSecurityContext: {}
+
+tests:
+  # `helm test` smoke pod: /healthz and, optionally, the configured upstream.
+  # Read-only - it never sends a master key and never writes anything.
+  enabled: true
+  image: python:3.12-slim
+  # Also GET <LITELLM_BASE_URL>/health/liveliness (unauthenticated, read-only).
+  checkUpstream: true

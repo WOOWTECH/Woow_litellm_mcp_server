@@ -1,0 +1,20 @@
+{{- /*
+/data/config.json lives here: admin password, MCP auth token, tool toggles and
+the token history. ReadWriteOnce, hence the Recreate strategy on the Deployment.
+Carries the keep policy - uninstalling the release must not delete it.
+*/ -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: litellm-mcp-data
+  namespace: {{ include "litellmMcp.ns" . }}
+  labels:
+    app.kubernetes.io/part-of: woow-litellm
+  {{- include "litellmMcp.keepAnnotations" . | nindent 2 }}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: {{ include "litellmMcp.storageClass" . }}
+  resources:
+    requests:
+      storage: {{ .Values.admin.storage.size }}

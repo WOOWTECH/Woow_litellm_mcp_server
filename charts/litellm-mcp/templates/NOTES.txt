@@ -1,0 +1,28 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as release {{ .Release.Name }}.
+
+  Namespace : {{ include "litellmMcp.ns" . }}{{ if and .Values.namespace.create (eq .Values.namespace.name .Release.Namespace) }} (release namespace - not managed by this chart){{ end }}
+  Console   : {{ include "litellmMcp.adminUrl" . }}
+  Secrets   : {{ .Values.existingSecrets.connection }}, {{ .Values.existingSecrets.admin }} ({{ if .Values.secrets.create }}rendered by this chart{{ else }}must already exist{{ end }})
+  Storage   : PVC litellm-mcp-data, {{ .Values.admin.storage.size }} on {{ include "litellmMcp.storageClass" . }}
+
+The pod clones {{ .Values.admin.gitRepo }}, runs `npm install && npm run build`
+and `pip install .[admin]` on every start: a cold start takes 2.5-3 minutes and
+needs GitHub, npm and PyPI to be reachable. Watch it with
+
+  kubectl -n {{ include "litellmMcp.ns" . }} rollout status deploy/litellm-mcp-admin --timeout=10m
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{ if ne .Values.namespace.name .Release.Namespace }}
+The smoke pod runs in {{ include "litellmMcp.ns" . }} (it reads LITELLM_BASE_URL from
+the Secret there), while the release lives in {{ .Release.Namespace }}, so
+`helm test --logs` looks in the wrong namespace. Read them directly:
+
+  kubectl -n {{ include "litellmMcp.ns" . }} logs {{ .Release.Name }}-smoke
+{{ end }}
+{{ if .Values.keepOnUninstall -}}
+`helm uninstall` keeps the Namespace, the PVC and the Secrets
+(helm.sh/resource-policy: keep), so /data/config.json - admin password, MCP
+token, tool toggles - survives.
+{{- else -}}
+keepOnUninstall is FALSE: `helm uninstall` will DELETE the PVC and with it
+/data/config.json (admin password, MCP token, tool toggles).
+{{- end }}

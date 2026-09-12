@@ -28,12 +28,21 @@ coverage.xml
 .tox/
 
 # --- Secrets / runtime state ----------------------------------------------
+# Secret patterns are anchored to the repo root (leading /) on purpose: an
+# unanchored "config.json" or "secrets.yaml" also matches
+# charts/litellm-mcp/templates/secrets.yaml and silently keeps a chart template
+# out of git. The `!/charts/**` / `!/deploy/**` lines at the end of this file
+# are the second belt, and CI fails if any chart file is ignored or untracked.
 .env
 .env.*
 !.env.example
-config.json
-data/
+/config.json
 /data/
+/secrets.yaml
+/*-secrets.yaml
+/*.secret.yaml
+/*secrets.values.yaml
+/*.local.yaml
 *.pem
 *.key
 
@@ -50,3 +59,10 @@ static/
 *.swp
 .DS_Store
 Thumbs.db
+
+# --- The chart is never ignored -------------------------------------------
+# Nothing under charts/ or deploy/ may be excluded by any pattern above: a
+# swallowed templates/secrets.yaml renders an install without its Secrets and
+# nobody notices until the pod cannot start.
+!/charts/**
+!/deploy/**

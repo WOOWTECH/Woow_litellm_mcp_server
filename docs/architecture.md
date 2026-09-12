@@ -226,8 +226,9 @@ to take it down.
 
 ## 9. One deployment path, and why the second one was removed
 
-There is exactly one supported way to run this project: `k8s-admin-deploy.yaml`, which
-deploys Deployment `litellm-mcp-admin` and Service `litellm-mcp-admin:8080`. The console
+There is exactly one supported way to run this project: the Helm chart
+[`../charts/litellm-mcp`](../charts/litellm-mcp), which deploys Deployment
+`litellm-mcp-admin` and Service `litellm-mcp-admin:8080`. The console
 spawns its own MCP server as a child process on `127.0.0.1:3000` through
 `mcp_admin_core/process.py`. The child's command line is stored in `/data/config.json`,
 not in the manifest, which is what lets the Settings page restart it and the Permissions
@@ -251,8 +252,10 @@ FINDING-003 in [`findings.md`](../findings.md).
 
 An unauthenticated endpoint that appears because of file layout rather than because
 somebody chose it is not a deployment mode; it is an accident with a manifest. The fix
-was to move the namespace and secret into `k8s-base.yaml`, which contains no workload,
-and delete the standalone Deployment outright. A cluster that genuinely wants an ungated
+was to move the namespace and secret into a file with no workload in it, and delete the
+standalone Deployment outright. The chart keeps that property structurally: it has no
+second workload template at all, and `secrets.create` is `false` by default, so a normal
+install renders neither a stray endpoint nor a placeholder credential. A cluster that genuinely wants an ungated
 in-cluster MCP endpoint can still get one — the package's `--host 0.0.0.0 --port 8000`
 entry point is unchanged — but it now has to be written down deliberately rather than
 inherited from the install instructions.

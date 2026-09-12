@@ -81,7 +81,7 @@ prompt injection 都無法說服模型去呼叫一個不存在的東西。
 從權杖頁輪替之後舊網址會立刻失效。權杖刻意放在路徑而不是 query string —— uvicorn 會把
 完整請求行寫進日誌，放在 query string 的祕密會出現在每一筆存取紀錄裡。
 
-**免 registry 的 Kubernetes 部署。** `k8s-admin-deploy.yaml` 使用三個 `initContainers`
+**免 registry 的 Kubernetes 部署。** Helm chart [`charts/litellm-mcp`](./charts/litellm-mcp) 使用三個 `initContainers`
 （`alpine/git` 負責 clone、`node:20-alpine` 建置 SPA、`python:3.12-slim` 初始化設定
 PVC），所以叢集只會拉取公開的上游映像。冷啟動約兩分半到三分鐘；SPA 建置步驟
 刻意以 `exit 0` 結尾，讓前端建置失敗只會讓主控台降級，而不是讓 Pod 陷入重啟迴圈。
@@ -372,9 +372,12 @@ flowchart LR
 | **`docs/`** | 補充設計文件與本文件中的所有截圖。 | `architecture.md`、`tool-catalog.md`、`deployment.md`、`encrypted-proxy.md`、`screenshots/` |
 
 部署與封裝相關檔案同樣位於根目錄：`Dockerfile`（兩階段，`node:20-alpine` →
-`python:3.12-slim`，`EXPOSE 8080`）、`docker-compose.yml`、`k8s-base.yaml`（namespace 與
-閘道 secret，不含任何 workload）、`k8s-admin-deploy.yaml`（整套主控台）、`pyproject.toml`、
-`mcp_admin_core.pyproject.toml`、`pytest.ini` 與 `.env.example`。
+`python:3.12-slim`，`EXPOSE 8080`）、`docker-compose.yml`、`charts/litellm-mcp/`（整套主控台
+的 Helm chart —— Namespace、PVC、Deployment、Service、選用的 Secret，以及一個 `helm test`
+smoke pod）、`deploy/woow-k3s/litellm-mcp.yaml`（正式環境 release 實際使用的 values，不含
+任何祕密）、`pyproject.toml`、`mcp_admin_core.pyproject.toml`、`pytest.ini` 與
+`.env.example`。這個 chart 取代的兩份手寫 manifest `k8s-base.yaml` 與
+`k8s-admin-deploy.yaml` 已經移除，說明見〈方式三〉。
 
 Python 套件合計 **7,206 行**；前端另有 **3,507 行** JSX 與 JS。
 
@@ -574,17 +577,85 @@ docker compose up --build
 
 ### 方式三 —— Kubernetes：主控台 + 加密代理 + MCP 子行程
 
-這是唯一受支援的正式部署。不需要建置映像，也不需要私有 registry：init container 把這個
-公開儲存庫 clone 進 `emptyDir`、建置 SPA、初始化設定 PVC，主容器再 `pip install .[admin]`
-並在 `:8080` 提供主控台。
+這是唯一受支援的正式部署，已封裝成 Helm chart
+[`charts/litellm-mcp`](./charts/litellm-mcp)。不需要建置映像，也不需要私有 registry：init
+container 把這個公開儲存庫 clone 進 `emptyDir`、建置 SPA、初始化設定 PVC，主容器再
+`pip install .[admin]` 並在 `:8080` 提供主控台。
+
+**步驟一 —— 先建立兩個 Secret**（只做一次，而且刻意放在 Helm 之外，這樣任何一次 upgrade
+都不可能用空值覆蓋掉已經輪替過的 token）：
 
 ```bash
-kubectl apply -f k8s-base.yaml           # namespace + litellm-mcp-secret
-kubectl apply -f k8s-admin-deploy.yaml   # 主控台 + 加密代理 + MCP 子行程 + PVC
+cp charts/litellm-mcp/examples/secrets.example.yaml /secure/path/litellm-mcp-secrets.yaml
+# 把每個 REPLACE_ME 換掉；MCP token 請產生、不要自己想：
+#   openssl rand -hex 32
+kubectl create namespace litellm-mcp --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f /secure/path/litellm-mcp-secrets.yaml
 ```
 
-`k8s-base.yaml` 內的祕密只是佔位值，套用前後請立刻換掉；而在已經有真實值的叢集上，請
-**直接跳過這個檔案**，不要用 `sk-REPLACE_ME` 覆蓋掉線上還在用的 master key。
+**步驟二 —— 安裝 chart。** 從 clone 安裝：
+
+```bash
+helm upgrade --install litellm-mcp charts/litellm-mcp \
+  -n litellm --create-namespace \
+  -f deploy/woow-k3s/litellm-mcp.yaml
+```
+
+或直接用 GitHub tarball，不必 clone：
+
+```bash
+helm upgrade --install litellm-mcp \
+  https://github.com/WOOWTECH/Woow_litellm_mcp_server/archive/refs/heads/main.tar.gz \
+  --repo "" --version "" \
+  -n litellm --create-namespace \
+  -f /secure/path/litellm-mcp-values.yaml   # deploy/woow-k3s/litellm-mcp.yaml 的副本
+```
+
+release 刻意放在 namespace `litellm`（與閘道 release 同一個），這樣 chart 才擁有
+`litellm-mcp` 這個 Namespace 物件本身：等於 release namespace 的 Namespace 永遠不會被渲染，
+`helm uninstall` 也就不可能刪掉它。
+
+步驟一的替代做法是 `secrets.create=true`，搭配一個放在**儲存庫之外**的 values 檔；每個值
+都有 `required()` 保護，漏掉任何一個會讓渲染直接失敗，而不是安裝一個佔位值：
+
+```bash
+helm upgrade --install litellm-mcp charts/litellm-mcp -n litellm --create-namespace \
+  -f deploy/woow-k3s/litellm-mcp.yaml -f /secure/path/litellm-mcp-secrets.values.yaml
+```
+
+**主要 values**（完整清單與註解見
+[`charts/litellm-mcp/values.yaml`](./charts/litellm-mcp/values.yaml)）：
+
+| Value | 預設 | 意義 |
+|---|---|---|
+| `namespace.create` / `namespace.name` | `true` / `litellm-mcp` | 是否渲染 Namespace。等於 release namespace 的那個永遠不渲染。 |
+| `keepOnUninstall` | `true` | 為 Namespace、PVC 與 chart 建立的 Secret 加上 `helm.sh/resource-policy: keep`。 |
+| `storageClassName` | `longhorn` | `litellm-mcp-data` 的 StorageClass；單節點叢集用 `local-path`。 |
+| `secrets.create` | `false` | 設為 `true` 才從 values 渲染兩個 Secret，每個值都是 `required()`。 |
+| `existingSecrets.connection` / `.admin` | `litellm-mcp-secret` / `litellm-mcp-admin-secret` | Deployment 讀取的 Secret 名稱。 |
+| `admin.gitRepo` | 本儲存庫 | 每次 Pod 啟動都會 clone 進 `/repo`。 |
+| `admin.images.{git,node,python}` | `alpine/git:latest`、`node:20-alpine`、`python:3.12-slim` | init 與執行期映像。 |
+| `admin.storage.size` | `256Mi` | 設定用 PVC。 |
+| `admin.resources` | 100m/256Mi → 1/1Gi | 記憶體高峰出現在 init container 的 `npm install`。 |
+| `hardening.disableServiceAccountToken` | `false` | 設為 `true` 會渲染 `automountServiceAccountToken: false`。 |
+| `hardening.disableUvicornAccessLog` | `false` | 設為 `true` 會加上 `--no-access-log`，讓路徑權杖不再寫進 Pod 日誌。 |
+| `hardening.{pod,container}SecurityContext` | `{}` | 非空時原樣渲染。 |
+| `tests.enabled` / `tests.checkUpstream` | `true` / `true` | `helm test` smoke pod，以及是否連帶探測 `LITELLM_BASE_URL`。 |
+
+所有 `hardening.*` 預設都是關閉的：打開任何一個都會改動 pod template、重啟主控台，屬於要
+挑維護時間做的決定，不該是 upgrade 的副作用。
+
+**驗證：**
+
+```bash
+kubectl -n litellm-mcp rollout status deploy/litellm-mcp-admin --timeout=10m
+helm test litellm-mcp -n litellm            # /healthz 與上游 liveliness，全唯讀
+# smoke pod 跑在 litellm-mcp（它要讀那裡的 Secret 取得 LITELLM_BASE_URL），release 卻在
+# litellm，所以 `--logs` 會找錯 namespace：
+kubectl -n litellm-mcp logs litellm-mcp-smoke
+kubectl -n litellm-mcp exec deploy/litellm-mcp-admin -c admin -- \
+  python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read())"
+```
 
 把 Cloudflare 隧道或任何 ingress 指向
 `http://litellm-mcp-admin.litellm-mcp.svc.cluster.local:8080`，唯一對外的 MCP 門就是
@@ -595,20 +666,43 @@ Cloudflare Bot Fight Mode 注意事項，都寫在
 
 三個 init container 執行期間，冷啟動約需兩分半到三分鐘。
 
-上面兩行指令是給**全新叢集**用的。`k8s-admin-deploy.yaml` 是「初次安裝」用的 manifest，
-不是可以反覆套用的收斂目標：它的第一份文件會用佔位值建立
-`Secret/litellm-mcp-admin-secret`，所以對正在運行的叢集整份重新套用，會把管理密碼、JWT
-祕密與代理 token 全部重設成 `REPLACE_ME…`，讓你登不進主控台，同時打斷所有已連線的用戶端。
-要升級線上部署，請只套用其中的 `Deployment` 那份文件，步驟見
-[`docs/deployment.md`](./docs/deployment.md#re-applying-to-a-running-cluster)。如果只是要
-更新 `main` 上的程式碼，根本不需要 apply —— `/repo` 每次啟動都會重新 clone，執行
-`kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp` 就夠了。
+**卸載不會刪資料。** 在 `keepOnUninstall: true`（預設）之下，Namespace、PVC
+`litellm-mcp-data` 以及 chart 建立的 Secret 都帶有 `helm.sh/resource-policy: keep`，因此
+`helm uninstall litellm-mcp -n litellm` 只會移除 Deployment 與 Service，
+`/data/config.json`（管理密碼、MCP token、工具開關、token 歷史）原封不動，重新安裝就會接回去。
 
-> **從舊版本升級？** 這個儲存庫過去還有第二份 manifest `k8s-deploy.yaml`，會把同一支伺服器
-> 裸跑在 `0.0.0.0:8000`、掛在 `Service/litellm-mcp` 後面，前面沒有任何驗證；而因為那個檔案
-> 同時帶著共用的 namespace 與 secret，照著文件的套用順序做，無論你要不要都會得到那個沒有
-> 閘控的端點。它已經被移除（見 [`findings.md`](./findings.md) 的 FINDING-003）。既有叢集請
-> 這樣清掉：
+**要更新程式碼**根本不需要 `helm upgrade`：`/repo` 每次啟動都會重新 clone，執行
+`kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp` 就夠了。由於 clone
+追的是預設分支，目前除了把 `admin.gitRepo` 指向 fork 或 tarball 之外沒有辦法釘住 commit，
+詳見 [`docs/deployment.md`](./docs/deployment.md)。
+
+**偏移檢查。** `CONTEXT=woow-k3s scripts/check-drift.sh` 會把這個 repo 的渲染結果同時與
+`helm get manifest` 及線上物件比對，有任何差異就以非零結束。
+
+> **原本用手寫 manifest 的人請看。** `k8s-base.yaml` 與 `k8s-admin-deploy.yaml` 已經移除。
+> 它們是「初次安裝」用的檔案，不是可以反覆套用的收斂目標：整份重新套用
+> `k8s-admin-deploy.yaml` 會把 `ADMIN_PASSWORD`、`MCP_AUTH_TOKEN`、`JWT_SECRET` 重設成
+> `REPLACE_ME…`；就連「只套用 namespace」的 `k8s-base.yaml` 用法也會覆蓋線上的
+> `LITELLM_MASTER_KEY`，因為那個 Secret 帶著指令所選的同一個 label。這個 chart 兩件事都做
+> 不到：`secrets.create` 預設是 `false`，完全不渲染任何 Secret。要在不重啟 Pod 的前提下接管
+> 既有安裝 —— 渲染出來的物件與線上逐欄位相同：
+>
+> ```bash
+> helm upgrade --install litellm-mcp charts/litellm-mcp -n litellm \
+>   -f deploy/woow-k3s/litellm-mcp.yaml --take-ownership
+> kubectl -n litellm-mcp get pod -l app=litellm-mcp-admin \
+>   -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,RESTARTS:.status.containerStatuses[0].restartCount
+> ```
+>
+> 在 woow-k3s 上，這些物件目前屬於
+> [`Woow_k3s_litellm`](https://github.com/WOOWTECH/Woow_k3s_litellm) 的 `litellm` release
+> （它的 `templates/mcp.yaml`）。搬到這個 chart 的步驟是：先把 Deployment 與 Service 加上
+> `helm.sh/resource-policy: keep` 註解，再用 `mcp.enabled=false` 對那個 release 做
+> `helm upgrade`，最後執行上面那條 `--take-ownership` 安裝。
+>
+> 更早的版本還有一份 `k8s-deploy.yaml`，會把同一支伺服器裸跑在 `0.0.0.0:8000`、掛在
+> `Service/litellm-mcp` 後面，前面沒有任何驗證（見 [`findings.md`](./findings.md) 的
+> FINDING-003）。叢集裡還留著的話請這樣清掉：
 >
 > ```bash
 > kubectl delete deployment litellm-mcp-server -n litellm-mcp
@@ -673,7 +767,8 @@ Cloudflare 邊緣的 TLS。它**不是**指靜態資料加密：設定儲存是�
 （`chmod 600`）與 API 回應中的祕密遮罩來保護。把這件事講清楚，比用行銷詞彙帶過重要得多。
 
 **祕密永遠不進儲存庫。** LiteLLM master key、salt key 與管理密碼只存在於 Kubernetes
-Secret 與容器環境變數中。`k8s-base.yaml` 與 `k8s-admin-deploy.yaml` 都只放佔位值。每個
+Secret 與容器環境變數中。chart 的 `secrets.create` 預設是 `false`，一般安裝完全不渲染
+Secret，而 `charts/litellm-mcp/examples/secrets.example.yaml` 只放佔位值。每個
 設定 API 回應都會遮罩祕密欄位，master key 更是唯寫 —— 可設定，永遠讀不回來。
 
 **`LITELLM_SALT_KEY` 只能設定一次，永遠不要輪替。** LiteLLM 用它加密資料庫欄位；輪替之後

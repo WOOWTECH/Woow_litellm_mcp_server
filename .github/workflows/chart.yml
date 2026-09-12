@@ -31,6 +31,9 @@ jobs:
             -f deploy/woow-k3s/litellm-mcp.yaml            > /tmp/production.yaml
           helm template litellm-mcp "$CHART"               > /tmp/defaults.yaml
           helm template litellm-mcp "$CHART" -n litellm-mcp > /tmp/release-ns.yaml
+          # namespace.name != release namespace: the only combination that renders
+          # templates/namespace.yaml (empty name follows -n and is skipped by design).
+          helm template litellm-mcp "$CHART" -n litellm-mcp --set namespace.name=other-ns > /tmp/other-ns.yaml
           helm template litellm-mcp "$CHART" -n litellm --set "$S" > /tmp/secrets.yaml
           helm template litellm-mcp "$CHART" -n litellm \
             --set keepOnUninstall=false,namespace.create=false,tests.enabled=false,tests.checkUpstream=false \

@@ -10,7 +10,7 @@ namespace:
   # On woow-k3s the release lives in `litellm` and this chart owns the
   # `litellm-mcp` Namespace, exactly as the litellm chart did before the split.
   create: true
-  name: litellm-mcp
+  name: ""
 
 # Add `helm.sh/resource-policy: keep` to the Namespace, the PVC and every
 # chart-created Secret, so `helm uninstall` never deletes /data/config.json

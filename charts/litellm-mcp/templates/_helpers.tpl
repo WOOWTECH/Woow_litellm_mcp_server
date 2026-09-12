@@ -5,8 +5,15 @@ name) on purpose: the Cloudflare tunnel routes to this exact Service name, and
 changing a selector or a pod-template label would restart the console.
 */}}
 
+{{- /*
+Object placement. `namespace.name` is EMPTY by default so placement follows
+`-n`/`--namespace`. Setting it makes it win over `-n`, so a
+`-n <test-ns> -f <real instance values>` rehearsal would write to the REAL
+namespace. That happened once on the sibling n8n chart and touched
+production. Never set it in any committed instance values file.
+*/ -}}
 {{- define "litellmMcp.ns" -}}
-{{ .Values.namespace.name }}
+{{ .Values.namespace.name | default .Release.Namespace }}
 {{- end -}}
 
 {{/* Shared label on every object. Kept as `woow-litellm` (not -mcp): it is the

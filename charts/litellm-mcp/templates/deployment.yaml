@@ -1,0 +1,228 @@
+{{- /*
+LiteLLM MCP admin console. Reproduced verbatim from the spec that is running on
+woow-k3s (it lived in the litellm chart's templates/mcp.yaml until this chart
+took it over), so `helm template` with deploy/woow-k3s/litellm-mcp.yaml equals
+the live object field for field and a takeover restarts nothing.
+
+- Recreate strategy: the data PVC is ReadWriteOnce.
+- The Secrets seed the FIRST boot only; afterwards /data/config.json is the
+  source of truth for admin password, MCP token and tool toggles. The
+  `connection` block is the exception and is re-read from the Secret every
+  start, so rotating the LiteLLM master key reaches the console on restart.
+- The init scripts are kept verbatim, comments included. Read them before
+  editing: each comment records a regression that the current shape prevents.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: litellm-mcp-admin
+    app.kubernetes.io/part-of: woow-litellm
+  name: litellm-mcp-admin
+  namespace: {{ include "litellmMcp.ns" . }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm-mcp-admin
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: litellm-mcp-admin
+    spec:
+      {{- if .Values.hardening.disableServiceAccountToken }}
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- with .Values.hardening.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - command:
+        - sh
+        - -c
+        - |
+          set -eux
+          pip install --no-cache-dir ".[admin]"
+          exec uvicorn litellm_mcp_admin.main:app --host 0.0.0.0 --port 8080{{ if .Values.hardening.disableUvicornAccessLog }} --no-access-log{{ end }}
+        env:
+        - name: MCP_ADMIN_CONFIG
+          value: /data/config.json
+        - name: JWT_EXPIRY_HOURS
+          value: '{{ .Values.admin.jwtExpiryHours }}'
+        - name: PYTHONUNBUFFERED
+          value: '1'
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: JWT_SECRET
+              name: {{ .Values.existingSecrets.admin }}
+        image: {{ .Values.admin.images.python }}
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 6
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 180
+          periodSeconds: 20
+          timeoutSeconds: 1
+        name: admin
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          failureThreshold: 30
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 1
+        resources:
+          {{- toYaml .Values.admin.resources | nindent 10 }}
+        {{- with .Values.hardening.containerSecurityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        volumeMounts:
+        - mountPath: /repo
+          name: repo
+        - mountPath: /data
+          name: data
+        workingDir: /repo
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - |
+          set -eux
+          rm -rf /repo/* /repo/.git || true
+          git clone --depth 1 {{ .Values.admin.gitRepo }} /repo
+        image: {{ .Values.admin.images.git }}
+        imagePullPolicy: Always
+        name: git-clone
+        resources: {}
+        volumeMounts:
+        - mountPath: /repo
+          name: repo
+      - command:
+        - sh
+        - -c
+        - |
+          set -x
+          # This step used to `cp frontend-overrides/ConnectionConfig.jsx` over
+          # the page source and `sed` residual EMQX strings out of the shared
+          # SPA. Both are gone on purpose: the override silently reverted every
+          # fix made to frontend/src/pages/ConnectionConfig.jsx (the running pod
+          # shipped the stale copy), and the sed only masked leftover branding
+          # that is now correct in the source itself. Do NOT reintroduce either —
+          # frontend/src is the single source of truth for the console.
+          npm install --no-audit --no-fund && npm run build \
+            && mkdir -p /repo/static && cp -r dist/* /repo/static/ \
+            || echo "SPA build failed - admin API + proxy will still run"
+          exit 0
+        image: {{ .Values.admin.images.node }}
+        imagePullPolicy: IfNotPresent
+        name: spa-build
+        resources: {}
+        volumeMounts:
+        - mountPath: /repo
+          name: repo
+        workingDir: /repo/frontend
+      - command:
+        - python
+        - -c
+        - |
+          import json, os, pathlib
+          p = pathlib.Path("/data/config.json")
+          cfg = json.loads(p.read_text()) if p.exists() else {}
+          # setdefault, NOT assignment. These two are the console's own
+          # credentials and the console can change them at runtime: the
+          # Settings page changes admin_password, the Tokens page rotates
+          # mcp_auth_token. Assigning here unconditionally made every pod
+          # restart silently revert both to whatever the Secret still held —
+          # a rotated token would keep working until the next restart and
+          # then die without anyone touching it. This was FINDING-004.
+          # The Secret seeds the FIRST boot; after that /data is the truth.
+          cfg.setdefault("admin_password", os.environ["ADMIN_PASSWORD"])
+          cfg.setdefault("mcp_auth_token", os.environ["MCP_AUTH_TOKEN"])
+          # The upstream connection is different: it is infrastructure, not
+          # user state, and the Secret is its source of truth. Rotating the
+          # LiteLLM master key must reach the console on the next restart,
+          # so this one stays an assignment on purpose.
+          cfg["connection"] = {
+              "litellm_mcp_base_url": os.environ["LITELLM_BASE_URL"],
+              "litellm_mcp_master_key": os.environ["LITELLM_MASTER_KEY"],
+          }
+          # Preserve the child env across restarts: the Tools page writes the
+          # LITELLM_MCP_* gating switches in here, and blindly resetting it to
+          # {} silently un-did every GUI toggle on every pod restart.
+          prev_env = (cfg.get("mcp_server") or {}).get("env") or {}
+          cfg["mcp_server"] = {
+              "command": "python",
+              "args": ["-m", "woow_litellm_mcp_server.server",
+                       "--transport", "http", "--host", "127.0.0.1",
+                       "--port", "3000", "--path", "/mcp/"],
+              "port": 3000,
+              "env": prev_env,
+          }
+          cfg.setdefault("proxy", {"timeout": 86400})
+          # Canonical tools shape. `disabled` is the legacy key; migrate it into
+          # disabled_tools once and drop it so the reader never sees both.
+          tools = cfg.get("tools") or {}
+          legacy = tools.pop("disabled", None)
+          if legacy:
+              tools["disabled_tools"] = sorted(
+                  set(tools.get("disabled_tools") or []) | set(legacy))
+          tools.setdefault("readonly", False)
+          tools.setdefault("disabled_categories", [])
+          tools.setdefault("disabled_tools", [])
+          tools.setdefault("disabled_operations", {})
+          perms = tools.get("permissions") or {}
+          perms.setdefault("allowed_tools", ["*"])
+          perms.setdefault("denied_tools", [])
+          tools["permissions"] = perms
+          cfg["tools"] = tools
+          cfg.setdefault("token_history", [])
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_text(json.dumps(cfg, indent=2))
+          os.chmod(p, 0o600)
+          print("seeded", p)
+        env:
+        - name: ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: ADMIN_PASSWORD
+              name: {{ .Values.existingSecrets.admin }}
+        - name: MCP_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: MCP_AUTH_TOKEN
+              name: {{ .Values.existingSecrets.admin }}
+        - name: LITELLM_BASE_URL
+          valueFrom:
+            secretKeyRef:
+              key: LITELLM_BASE_URL
+              name: {{ .Values.existingSecrets.connection }}
+        - name: LITELLM_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              key: LITELLM_MASTER_KEY
+              name: {{ .Values.existingSecrets.connection }}
+        image: {{ .Values.admin.images.python }}
+        imagePullPolicy: IfNotPresent
+        name: seed-config
+        resources: {}
+        volumeMounts:
+        - mountPath: /data
+          name: data
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir: {}
+        name: repo
+      - name: data
+        persistentVolumeClaim:
+          claimName: litellm-mcp-data

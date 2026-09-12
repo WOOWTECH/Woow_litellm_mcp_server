@@ -1,0 +1,57 @@
+# Instance values for the woow-k3s console at https://litellm-mcp.woowtech.io.
+# NO SECRETS HERE - the two Secrets live in the cluster and are created from
+# charts/litellm-mcp/examples/secrets.example.yaml.
+#
+#   helm --kube-context woow-k3s upgrade --install litellm-mcp \
+#     charts/litellm-mcp -n litellm -f deploy/woow-k3s/litellm-mcp.yaml
+#
+# The release lives in namespace `litellm` (beside the litellm gateway release)
+# so that this chart owns the `litellm-mcp` Namespace object, exactly as the
+# litellm chart did before the split. Every value below is the value that is
+# running today; rendering with this file reproduces the live objects field for
+# field, so the takeover restarts nothing.
+
+namespace:
+  create: true
+  name: litellm-mcp
+
+keepOnUninstall: true
+storageClassName: longhorn
+
+secrets:
+  # The Secrets already exist and are NOT managed by Helm.
+  create: false
+
+existingSecrets:
+  connection: litellm-mcp-secret
+  admin: litellm-mcp-admin-secret
+
+admin:
+  gitRepo: https://github.com/WOOWTECH/Woow_litellm_mcp_server
+  images:
+    git: alpine/git:latest
+    node: node:20-alpine
+    python: python:3.12-slim
+  jwtExpiryHours: 12
+  storage:
+    className: ""
+    size: 256Mi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# All off: turning any of these on rolls the console pod. See README "Follow-ups".
+hardening:
+  disableServiceAccountToken: false
+  disableUvicornAccessLog: false
+  podSecurityContext: {}
+  containerSecurityContext: {}
+
+tests:
+  enabled: true
+  image: python:3.12-slim
+  checkUpstream: true

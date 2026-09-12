@@ -1,0 +1,23 @@
+apiVersion: v2
+name: litellm-mcp
+description: >-
+  LiteLLM MCP admin console on K3s: the FastMCP server for a LiteLLM gateway
+  plus its React/FastAPI console and token-authenticated MCP proxy, cloned and
+  built from this repository on every pod start (no image to publish).
+type: application
+version: 1.0.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - litellm
+  - mcp
+  - fastmcp
+  - admin
+  - console
+home: https://github.com/WOOWTECH/Woow_litellm_mcp_server
+sources:
+  - https://github.com/WOOWTECH/Woow_litellm_mcp_server
+  - https://github.com/WOOWTECH/Woow_k3s_litellm
+maintainers:
+  - name: WoowTech
+    url: https://github.com/WOOWTECH

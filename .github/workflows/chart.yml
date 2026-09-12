@@ -1,0 +1,119 @@
+name: chart
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+env:
+  CHART: charts/litellm-mcp
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.5
+
+      - name: helm lint
+        run: |
+          helm lint "$CHART"
+          helm lint "$CHART" -f deploy/woow-k3s/litellm-mcp.yaml
+
+      - name: helm template (every values combination)
+        run: |
+          S="secrets.create=true,secrets.litellmBaseUrl=http://x:4000,secrets.litellmMasterKey=x,secrets.adminPassword=x,secrets.mcpAuthToken=x,secrets.jwtSecret=x"
+          helm template litellm-mcp "$CHART" -n litellm \
+            -f deploy/woow-k3s/litellm-mcp.yaml            > /tmp/production.yaml
+          helm template litellm-mcp "$CHART"               > /tmp/defaults.yaml
+          helm template litellm-mcp "$CHART" -n litellm-mcp > /tmp/release-ns.yaml
+          helm template litellm-mcp "$CHART" -n litellm --set "$S" > /tmp/secrets.yaml
+          helm template litellm-mcp "$CHART" -n litellm \
+            --set keepOnUninstall=false,namespace.create=false,tests.enabled=false,tests.checkUpstream=false \
+                                                            > /tmp/minimal.yaml
+          helm template litellm-mcp "$CHART" -n litellm \
+            --set hardening.disableServiceAccountToken=true,hardening.disableUvicornAccessLog=true \
+            --set-json 'hardening.podSecurityContext={"runAsNonRoot":true,"runAsUser":1000,"fsGroup":1000}' \
+            --set-json 'hardening.containerSecurityContext={"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]}}' \
+                                                            > /tmp/hardened.yaml
+
+      - name: kubeconform (schema validation)
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -strict -summary \
+            /tmp/production.yaml /tmp/defaults.yaml /tmp/release-ns.yaml \
+            /tmp/secrets.yaml /tmp/minimal.yaml /tmp/hardened.yaml
+
+      - name: Every template renders (catches a .gitignore swallowing one)
+        run: |
+          for t in namespace pvc service deployment secrets tests/smoke; do
+            test -f "$CHART/templates/$t.yaml" || { echo "missing template: $t.yaml"; exit 1; }
+          done
+          for t in namespace.yaml pvc.yaml service.yaml deployment.yaml secrets.yaml tests/smoke.yaml; do
+            grep -q "# Source: litellm-mcp/templates/$t" /tmp/secrets.yaml \
+              || { echo "template never rendered: $t"; exit 1; }
+          done
+          echo "all 6 templates render"
+
+      - name: Required values are enforced
+        run: |
+          if helm template litellm-mcp "$CHART" --set secrets.create=true > /dev/null 2>&1; then
+            echo "secrets.create=true rendered without any secret values"; exit 1
+          fi
+          G="secrets.create=true,secrets.litellmBaseUrl=x,secrets.litellmMasterKey=x,secrets.adminPassword=x,secrets.mcpAuthToken=x,secrets.jwtSecret=x"
+          for k in litellmBaseUrl litellmMasterKey adminPassword mcpAuthToken jwtSecret; do
+            # Blank exactly one value; every other one stays set.
+            if helm template litellm-mcp "$CHART" --set "${G//secrets.$k=x/secrets.$k=}" > /dev/null 2>&1; then
+              echo "required() did not fire for secrets.$k"; exit 1
+            fi
+          done
+          echo "required() guards fire for all 5 secret values"
+          n=$(grep -c '^kind: Secret$' /tmp/secrets.yaml || true)
+          [ "$n" -eq 2 ] || { echo "expected 2 Secrets with secrets.create=true, got $n"; exit 1; }
+          echo "secrets.create=true renders both Secrets"
+
+      - name: No secrets committed
+        run: |
+          pip install --quiet pyyaml
+          python3 - <<'PY'
+          import sys, yaml
+          bad = []
+          v = yaml.safe_load(open("charts/litellm-mcp/values.yaml"))
+          for k, val in v["secrets"].items():
+              if k != "create" and val:
+                  bad.append(f"values.yaml secrets.{k} must be empty")
+          if v["secrets"]["create"]:
+              bad.append("values.yaml secrets.create must default to false")
+          inst = yaml.safe_load(open("deploy/woow-k3s/litellm-mcp.yaml"))
+          if (inst.get("secrets") or {}).get("create"):
+              bad.append("instance values must not enable secrets.create")
+          for k, val in (inst.get("secrets") or {}).items():
+              if k != "create" and val:
+                  bad.append(f"instance values carry secrets.{k}")
+          for d in yaml.safe_load_all(open("/tmp/production.yaml")):
+              if d and d["kind"] == "Secret":
+                  bad.append("default/production render must not contain Secrets")
+          for d in yaml.safe_load_all(open("charts/litellm-mcp/examples/secrets.example.yaml")):
+              for k, val in ((d or {}).get("stringData") or {}).items():
+                  if k != "LITELLM_BASE_URL" and "REPLACE_ME" not in str(val):
+                      bad.append(f"examples: {d['metadata']['name']}.{k} is not a placeholder")
+          sys.exit("\n".join(bad)) if bad else print("no secrets committed")
+          PY
+
+      - name: Chart files are not gitignored
+        run: |
+          # Plain check-ignore prints only genuinely ignored paths (a `!` rule prints nothing).
+          out=$(find charts deploy -type f -print0 | xargs -0 -r git check-ignore || true)
+          if [ -n "$out" ]; then echo "these chart files are gitignored:"; echo "$out"; exit 1; fi
+          # Every chart/instance file on disk must also be tracked by git.
+          missing=$(comm -23 <(find charts deploy -type f | sort) <(git ls-files charts deploy | sort))
+          if [ -n "$missing" ]; then echo "untracked chart files:"; echo "$missing"; exit 1; fi
+          echo "no chart file is ignored, all are tracked"
+
+      - name: Shell scripts parse
+        run: bash -n scripts/*.sh

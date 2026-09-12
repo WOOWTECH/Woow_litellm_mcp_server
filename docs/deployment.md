@@ -3,6 +3,18 @@
 Operational notes for running `Woow_litellm_mcp_server` on k3s, written against the
 live deployment at `https://litellm-mcp.woowtech.io`.
 
+The objects are packaged as the Helm chart
+[`../charts/litellm-mcp`](../charts/litellm-mcp); the values the live release runs with
+are [`../deploy/woow-k3s/litellm-mcp.yaml`](../deploy/woow-k3s/litellm-mcp.yaml). The
+hand-written `k8s-base.yaml` / `k8s-admin-deploy.yaml` have been removed — every
+`kubectl apply` recipe below is superseded by `helm upgrade --install`, and the reason
+each rule existed is noted where it still applies to the chart.
+
+On woow-k3s these objects are, at the time of writing, still owned by the `litellm`
+release of [`Woow_k3s_litellm`](https://github.com/WOOWTECH/Woow_k3s_litellm)
+(`templates/mcp.yaml`); [Taking over an existing install](#taking-over-an-existing-install)
+is the move to this chart.
+
 ---
 
 ## Topology
@@ -20,7 +32,7 @@ service-to-service calls.
 
 ### The server is a child process, not a workload
 
-`k8s-admin-deploy.yaml` runs the admin console on `0.0.0.0:8080`, and the console
+The chart's `Deployment` runs the admin console on `0.0.0.0:8080`, and the console
 *spawns its own FastMCP child* as a subprocess bound to `127.0.0.1:3000`. There is no
 second pod, no second Service and nothing to scale independently. The child's command
 line is written into `/data/config.json` by the `seed-config` init container:
@@ -76,8 +88,9 @@ The reason it had to go is not that a second workload is wasteful — it is that
 also carried the shared `Namespace` and `Secret/litellm-mcp-secret` that the console
 depends on, and the bare Deployment inside it was active by default. Anyone following
 the documented apply order got the unauthenticated endpoint whether they wanted it or
-not. That is FINDING-003 in [`findings.md`](../findings.md). The namespace and secret now
-live alone in `k8s-base.yaml`, which contains no workload at all.
+not. That is FINDING-003 in [`findings.md`](../findings.md). In the chart the equivalent
+guarantee is structural: `secrets.create` is `false` by default, so a normal install
+renders no `Secret` at all, and there is no second workload template to enable.
 
 If you are upgrading a cluster that still runs it:
 
@@ -130,9 +143,9 @@ in the Secret must reach the console on the next restart.
 > silently reverted on the next pod restart — a rotated token kept working until an
 > eviction and then died with nothing to blame. That is FINDING-004 in
 > [`findings.md`](../findings.md). A cluster running the old manifest keeps the old
-> behaviour until the Deployment object is re-applied; see
-> [Re-applying to a running cluster](#re-applying-to-a-running-cluster) below, which is
-> not a plain `kubectl apply -f` of this file.
+> behaviour until the `Deployment` object is replaced; see
+> [Upgrading a running install](#upgrading-a-running-install) below — step 2 of that
+> checklist exists for exactly this case.
 
 The one legacy migration it performs is folding a pre-existing `tools.disabled` list
 into `tools.disabled_tools` and dropping the old key, so a reader never sees both.
@@ -146,7 +159,7 @@ interpret a pod sitting in `Init:2/3` for two minutes as a failure.
 **`/repo` is an emptyDir**, repopulated on every restart. This means a pod restart
 always picks up the current `main` branch — deployment is `git push` followed by
 `kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp`. It also means
-there is no way to pin a commit without editing the manifest.
+there is no way to pin a commit without pointing `admin.gitRepo` at a fork or a tarball.
 
 **`strategy: Recreate`** is required, not stylistic. See
 [`architecture.md` §6](./architecture.md#6-why-recreate-and-why-exit-0).
@@ -155,40 +168,48 @@ there is no way to pin a commit without editing the manifest.
 
 ## First deploy
 
-Two manifests, applied in order. `k8s-base.yaml` carries the namespace and the gateway
-credentials and **no workload**; `k8s-admin-deploy.yaml` carries the entire console
-stack.
-
-This section is for an **empty cluster**. Both manifests seed credentials with
-placeholders, so applying either one wholesale over a running install destroys live
-secrets — see [Re-applying to a running cluster](#re-applying-to-a-running-cluster).
+Two steps: create the Secrets once, outside Helm, then install the chart. This section is
+for an **empty cluster**; for a cluster that already runs the console see
+[Taking over an existing install](#taking-over-an-existing-install).
 
 ```bash
-# 1. Namespace + Secret/litellm-mcp-secret.
-#    Do NOT commit real keys. Create the secret from the command line instead of
-#    editing the file, so the master key never touches the working tree:
-kubectl apply -f k8s-base.yaml            # namespace (secret has placeholders)
+# 1. Namespace + the two Secrets. Create them from the command line rather than
+#    editing a file, so no key ever touches the working tree.
+kubectl create namespace litellm-mcp --dry-run=client -o yaml | kubectl apply -f -
+
 kubectl create secret generic litellm-mcp-secret -n litellm-mcp \
   --from-literal=LITELLM_BASE_URL='http://litellm.litellm.svc.cluster.local:4000' \
   --from-literal=LITELLM_MASTER_KEY='sk-…' \
+  --from-literal=JWT_SECRET="$(python -c 'import secrets;print(secrets.token_hex(32))')" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# 2. Console credentials. Same rule — replace the placeholders in
-#    Secret/litellm-mcp-admin-secret before or immediately after applying.
 #      ADMIN_PASSWORD   console login
-#      MCP_AUTH_TOKEN   python -c "import secrets;print(secrets.token_urlsafe(32))"
-#      JWT_SECRET       python -c "import secrets;print(secrets.token_hex(32))"
-#
-# 3. Admin console + encrypted proxy + loopback MCP child + PVC
-kubectl apply -f k8s-admin-deploy.yaml
+#      MCP_AUTH_TOKEN   the ONLY credential on /private_{token}/mcp/ — generate it
+#      JWT_SECRET       signs console sessions
+kubectl create secret generic litellm-mcp-admin-secret -n litellm-mcp \
+  --from-literal=ADMIN_PASSWORD='…' \
+  --from-literal=MCP_AUTH_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')" \
+  --from-literal=JWT_SECRET="$(python -c 'import secrets;print(secrets.token_hex(32))')" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-# 4. Watch the init chain
+# 2. The console: PVC + Deployment + Service (+ the Namespace object itself).
+helm upgrade --install litellm-mcp charts/litellm-mcp \
+  -n litellm --create-namespace \
+  -f deploy/woow-k3s/litellm-mcp.yaml
+
+# 3. Watch the init chain, then run the read-only smoke test.
 kubectl get pods -n litellm-mcp -w
+kubectl -n litellm-mcp rollout status deploy/litellm-mcp-admin --timeout=10m
+helm test litellm-mcp -n litellm --logs
 ```
 
-On a cluster that already has the namespace and a real `litellm-mcp-secret`, **skip step
-1 entirely** — applying `k8s-base.yaml` over it would overwrite the live master key with
-the placeholder.
+The release lives in namespace `litellm` on purpose: a `Namespace` equal to the release
+namespace is never rendered, so putting the release next to the gateway lets the chart own
+the `litellm-mcp` Namespace object while keeping `helm uninstall` unable to delete it.
+
+`secrets.create=true` is the alternative to step 1 — every value is `required()`, so a
+missing one fails the render instead of installing a placeholder. Keep that values file
+**outside** the repository.
 
 Once the pod is `Running`:
 
@@ -205,24 +226,22 @@ freshly provisioned PVC would seed from.
 
 ---
 
-## Re-applying to a running cluster
+## Upgrading a running install
 
-`k8s-admin-deploy.yaml` is a bootstrap manifest, not a reconciliation target. Its first
-document is `Secret/litellm-mcp-admin-secret` with placeholder credentials, so on a live
-cluster `kubectl apply -f k8s-admin-deploy.yaml` resets `ADMIN_PASSWORD`,
-`MCP_AUTH_TOKEN` and `JWT_SECRET` to the literal `REPLACE_ME…` strings. That locks you out
-of the console and breaks every client bound to the current `/private_{token}/mcp/` URL,
-at the same moment the pod is restarting. Apply the `Deployment` document alone:
+`helm upgrade` is now the reconciliation path, and the two ways the old manifests could
+destroy a live install are gone by construction: the chart renders no Secret unless you
+ask it to, and it has no "apply the whole file" mode that could reset `ADMIN_PASSWORD`,
+`MCP_AUTH_TOKEN` or `JWT_SECRET` to a placeholder.
 
 ```bash
-# Extract document 3 (the Deployment) and nothing else.
-python - <<'PY' > /tmp/deploy.yaml
-print(open('k8s-admin-deploy.yaml').read().split('\n---\n')[2])
-PY
-kubectl apply -f /tmp/deploy.yaml
+helm diff upgrade litellm-mcp charts/litellm-mcp -n litellm \
+  -f deploy/woow-k3s/litellm-mcp.yaml            # if the diff plugin is installed
+CONTEXT=woow-k3s scripts/check-drift.sh          # or compare repo / release / cluster
+helm upgrade litellm-mcp charts/litellm-mcp -n litellm \
+  -f deploy/woow-k3s/litellm-mcp.yaml
 ```
 
-Before applying, run through this:
+Before an upgrade that changes the pod template, run through this:
 
 1. **Back up the config.** `kubectl exec -n litellm-mcp deploy/litellm-mcp-admin -c admin
    -- cp /data/config.json /data/config.json.pre-upgrade.bak`. Prune old backups
@@ -233,12 +252,14 @@ Before applying, run through this:
    clients. Compare by digest, never by printing values — mount both secrets into a
    throwaway pod and `sha256sum` each, then diff against the same digests taken from
    `/data/config.json`. If they disagree, update the Secret to the live values first.
-3. **Diff the object against the manifest** so you know what the apply will actually
-   change. `kubectl get deploy litellm-mcp-admin -n litellm-mcp -o yaml` and compare the
-   pod template.
-4. **Expect downtime.** `strategy: Recreate` plus a 2.5–3 minute cold start means the
-   console *and* the public MCP endpoint are unavailable for roughly three to four
-   minutes. There is no zero-downtime path while the config PVC is `ReadWriteOnce`.
+3. **Know what will change.** `scripts/check-drift.sh` prints the exact field-level
+   difference between the chart, the release manifest and the live objects. A render that
+   matches the live objects field for field rolls nothing.
+4. **Expect downtime whenever the pod template changes.** `strategy: Recreate` plus a
+   2.5–3 minute cold start means the console *and* the public MCP endpoint are unavailable
+   for roughly three to four minutes. There is no zero-downtime path while the config PVC
+   is `ReadWriteOnce`. Every `hardening.*` switch is such a change — that is why they are
+   off by default.
 
 Afterwards, verify rather than assume: the new pod should be `1/1` with **0 restarts**,
 `/data/config.json` should be unchanged (compare the sha256 against the backup), and an
@@ -247,11 +268,83 @@ end-to-end call through the public URL should succeed. If the change touched
 synthetic config — reading the YAML back only proves the apply landed, not that the script
 behaves.
 
-If all you need is to pick up new code from `main`, you do not need an apply at all:
+If all you need is to pick up new code from `main`, you do not need an upgrade at all:
 `/repo` is an emptyDir re-cloned on every start, so
 `kubectl rollout restart deployment/litellm-mcp-admin -n litellm-mcp` is enough.
 
 ---
+
+## Taking over an existing install
+
+The objects may already exist — created by the old manifests, or owned by the `litellm`
+release of `Woow_k3s_litellm`. Because the chart renders them field-identically, the
+takeover is metadata-only and **restarts nothing**.
+
+From the old `kubectl apply` manifests, or any unmanaged objects:
+
+```bash
+helm upgrade --install litellm-mcp charts/litellm-mcp -n litellm \
+  -f deploy/woow-k3s/litellm-mcp.yaml --take-ownership
+```
+
+From the `litellm` release of `Woow_k3s_litellm`, which still renders these four objects
+in its `templates/mcp.yaml`. Its `Namespace` and `PVC` already carry
+`helm.sh/resource-policy: keep`; the `Deployment` and `Service` do not, and an upgrade that
+stops rendering them would delete them, so annotate those two first:
+
+```bash
+# 1. Protect the two objects that have no keep policy yet.
+kubectl -n litellm-mcp annotate deployment/litellm-mcp-admin service/litellm-mcp-admin \
+  helm.sh/resource-policy=keep --overwrite
+
+# 2. Record what must not change.
+kubectl -n litellm-mcp get pod -l app=litellm-mcp-admin \
+  -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,\
+RESTARTS:.status.containerStatuses[0].restartCount
+kubectl -n litellm-mcp get rs -l app=litellm-mcp-admin -o name
+
+# 3. Drop the MCP objects out of the gateway release (they stay in the cluster).
+helm upgrade litellm <Woow_k3s_litellm checkout> -n litellm --reuse-values \
+  --set mcp.enabled=false
+
+# 4. Adopt them here.
+helm upgrade --install litellm-mcp charts/litellm-mcp -n litellm \
+  -f deploy/woow-k3s/litellm-mcp.yaml --take-ownership
+
+# 5. Prove nothing moved: same pod name, same UID, same restart count, same ReplicaSet.
+kubectl -n litellm-mcp get pod -l app=litellm-mcp-admin \
+  -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,\
+RESTARTS:.status.containerStatuses[0].restartCount
+helm test litellm-mcp -n litellm --logs
+```
+
+Step 1 leaves a `helm.sh/resource-policy: keep` annotation on the `Deployment` and
+`Service` that the chart itself does not render. It is harmless — it only makes
+`helm uninstall` leave them behind — but remove it afterwards if you want uninstall to
+clean up the workload:
+
+```bash
+kubectl -n litellm-mcp annotate deployment/litellm-mcp-admin service/litellm-mcp-admin \
+  helm.sh/resource-policy- --overwrite
+```
+
+---
+
+## Uninstalling
+
+```bash
+helm uninstall litellm-mcp -n litellm
+```
+
+With `keepOnUninstall: true` (the default) the `Namespace`, the `PVC litellm-mcp-data` and
+any chart-created `Secret` carry `helm.sh/resource-policy: keep`, so this removes the
+`Deployment` and `Service` only. `/data/config.json` — admin password, MCP token, tool
+toggles, token history — survives, and a re-install picks it up. Deleting the data is a
+deliberate, separate act:
+
+```bash
+kubectl -n litellm-mcp delete pvc litellm-mcp-data   # irreversible
+```
 
 ## Getting the public MCP URL
 

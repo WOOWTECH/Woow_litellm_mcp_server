@@ -11,10 +11,9 @@
 # running today; rendering with this file reproduces the live objects field for
 # field, so the takeover restarts nothing.
 
-namespace:
-  create: true
-  name: litellm-mcp
-
+# SAFETY: do NOT set `namespace:` here. Placement is controlled entirely by
+# `-n`/`--namespace`; a values-file namespace silently wins over `-n`, so a
+# rehearsal with a test `-n` would write into the REAL live namespace.
 keepOnUninstall: true
 storageClassName: longhorn
 

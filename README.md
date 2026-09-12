@@ -696,7 +696,10 @@ template and restarts the console; they are deliberate maintenance-window change
 
 ```bash
 kubectl -n litellm-mcp rollout status deploy/litellm-mcp-admin --timeout=10m
-helm test litellm-mcp -n litellm --logs      # /healthz + upstream liveliness, read-only
+helm test litellm-mcp -n litellm            # /healthz + upstream liveliness, read-only
+# The smoke pod runs in litellm-mcp (it reads LITELLM_BASE_URL from the Secret there)
+# while the release lives in litellm, so `--logs` looks in the wrong namespace:
+kubectl -n litellm-mcp logs litellm-mcp-smoke
 kubectl -n litellm-mcp exec deploy/litellm-mcp-admin -c admin -- \
   python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read())"
 ```

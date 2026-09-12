@@ -10,8 +10,14 @@ and `pip install .[admin]` on every start: a cold start takes 2.5-3 minutes and
 needs GitHub, npm and PyPI to be reachable. Watch it with
 
   kubectl -n {{ include "litellmMcp.ns" . }} rollout status deploy/litellm-mcp-admin --timeout=10m
-  helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{ if ne .Values.namespace.name .Release.Namespace }}
+The smoke pod runs in {{ include "litellmMcp.ns" . }} (it reads LITELLM_BASE_URL from
+the Secret there), while the release lives in {{ .Release.Namespace }}, so
+`helm test --logs` looks in the wrong namespace. Read them directly:
 
+  kubectl -n {{ include "litellmMcp.ns" . }} logs {{ .Release.Name }}-smoke
+{{ end }}
 {{ if .Values.keepOnUninstall -}}
 `helm uninstall` keeps the Namespace, the PVC and the Secrets
 (helm.sh/resource-policy: keep), so /data/config.json - admin password, MCP

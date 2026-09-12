@@ -200,7 +200,10 @@ helm upgrade --install litellm-mcp charts/litellm-mcp \
 # 3. Watch the init chain, then run the read-only smoke test.
 kubectl get pods -n litellm-mcp -w
 kubectl -n litellm-mcp rollout status deploy/litellm-mcp-admin --timeout=10m
-helm test litellm-mcp -n litellm --logs
+helm test litellm-mcp -n litellm
+# The smoke pod runs in litellm-mcp, the release in litellm, so `--logs` looks in
+# the wrong namespace - read them directly:
+kubectl -n litellm-mcp logs litellm-mcp-smoke
 ```
 
 The release lives in namespace `litellm` on purpose: a `Namespace` equal to the release
@@ -315,7 +318,10 @@ helm upgrade --install litellm-mcp charts/litellm-mcp -n litellm \
 kubectl -n litellm-mcp get pod -l app=litellm-mcp-admin \
   -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,\
 RESTARTS:.status.containerStatuses[0].restartCount
-helm test litellm-mcp -n litellm --logs
+helm test litellm-mcp -n litellm
+# The smoke pod runs in litellm-mcp, the release in litellm, so `--logs` looks in
+# the wrong namespace - read them directly:
+kubectl -n litellm-mcp logs litellm-mcp-smoke
 ```
 
 Step 1 leaves a `helm.sh/resource-policy: keep` annotation on the `Deployment` and

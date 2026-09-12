@@ -649,7 +649,10 @@ helm upgrade --install litellm-mcp charts/litellm-mcp -n litellm --create-namesp
 
 ```bash
 kubectl -n litellm-mcp rollout status deploy/litellm-mcp-admin --timeout=10m
-helm test litellm-mcp -n litellm --logs      # /healthz 與上游 liveliness，全唯讀
+helm test litellm-mcp -n litellm            # /healthz 與上游 liveliness，全唯讀
+# smoke pod 跑在 litellm-mcp（它要讀那裡的 Secret 取得 LITELLM_BASE_URL），release 卻在
+# litellm，所以 `--logs` 會找錯 namespace：
+kubectl -n litellm-mcp logs litellm-mcp-smoke
 kubectl -n litellm-mcp exec deploy/litellm-mcp-admin -c admin -- \
   python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read())"
 ```

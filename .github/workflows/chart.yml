@@ -120,3 +120,20 @@ jobs:
 
       - name: Shell scripts parse
         run: bash -n scripts/*.sh
+
+      - name: "Rendered URLs never contain an empty namespace label"
+        run: |
+          # `namespace.name` defaults to "" so that -n controls placement, so any
+          # template that interpolates it directly produces "host..svc" - a DNS
+          # name with an empty label, which Python's IDNA codec rejects outright
+          # ("label empty or too long"). Every such string must go through the
+          # .ns helper instead.
+          for ns in litellm-mcp SENTINEL; do
+            out=$(helm template x charts/litellm-mcp -n "$ns")
+            if echo "$out" | grep -qE "\.\.svc\.cluster\.local"; then
+              echo "::error::rendered an empty namespace label with -n $ns:"
+              echo "$out" | grep -E "\.\.svc\.cluster\.local" | head -3
+              exit 1
+            fi
+          done
+          echo "no empty namespace label in any rendered DNS name"

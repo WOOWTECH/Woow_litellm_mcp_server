@@ -38,5 +38,5 @@ annotations:
 
 {{/* Service DNS name of the console, for tests and NOTES. */}}
 {{- define "litellmMcp.adminUrl" -}}
-http://litellm-mcp-admin.{{ .Values.namespace.name }}.svc.cluster.local:8080
+http://litellm-mcp-admin.{{ include "litellmMcp.ns" . }}.svc.cluster.local:8080
 {{- end -}}
